@@ -34,6 +34,17 @@ VAD (Silero) → нарезка на чанки → параллельное р�
 - **Диаризация спикеров** (`--diarize`): NVIDIA Nemotron-3-Diarization (ONNX, до 8 спикеров,
   перекрывающаяся речь, спикеры нумеруются по времени первого появления). Спикер пишется
   в каждое слово и сегмент (json) и префиксом `[SPEAKER_XX]` в srt/vtt. см. раздел «Диаризация».
+- **Многоканальный диалог** (`--split-channels`, `--turns`): каждый канал входа — отдельный
+  спикер (раздельные VAD/чанкер, метки `SPEAKER_0N` и `channel` в словах); dual-mono-источники
+  (корреляция каналов > 0.98) автоматически схлопываются в один канал. `--turns` строит реплики
+  диалога: пауза ≥ `--turn-gap` режет реплику, реплики упорядочены по времени.
+- **Подкоманды**: `lighttrans vad файл -o out.json` — интервалы речи Silero без распознавания
+  (json); `lighttrans bench файл …` — полный прогон с машиночитаемой сводкой этапов и RTF
+  (json в stdout, таблица — в stderr).
+- **HTTP-сервис** `lighttrans-server` (порт из gigaam-v3-runtime): batch-`POST /v1/transcribe`
+  (GigaAM v3 CTC/RNN-T), метрики Prometheus, `/health` `/readyz`, graceful shutdown,
+  верификация моделей по манифестам и CUDA-назначений по отпечаткам; провайдер выбирается
+  явно (`--ep cpu|cuda`), fallback запрещён. Подробности и статус фаз — [PORTING.md](PORTING.md).
 
 ## Точность пословных таймстампов (проверено)
 
@@ -201,6 +212,14 @@ scripts/run.sh lecture.mkv -m whisper-turbo --task translate -f srt,json
 scripts/run.sh interview.wav -m parakeet-v3 --diarize   # 25 языков + спикеры
 scripts/run.sh noisy_interview.mp4 --denoise             # DeepFilterNet 3: подавление шума перед распознаванием
 scripts/run.sh a.mp4 b.mp4 c.mp3 -m gigaam-v3 --workers 3     # несколько файлов за запуск
+scripts/run.sh panel.wav --split-channels --turns -o out # каждый канал — спикер, реплики диалога
+./target/release/lighttrans vad запись.mp4 -o speech.json     # интервалы речи Silero (json)
+./target/release/lighttrans bench запись.mp4 -m gigaam-v3     # этапы и RTF (json в stdout)
+
+# HTTP-сервис (после scripts/build.sh); лимиты и верификация — см. PORTING.md
+ASR_CUDA_CTC_ASSIGNMENT_SHA256=<64 hex> ASR_CUDA_RNNT_ASSIGNMENT_SHA256=<64 hex> \
+  ./target/release/lighttrans-server --port 9898
+curl -s --data-binary @audio.mp3 "http://127.0.0.1:9898/v1/transcribe?model=gigaam-v3&words=true"
 ```
 
 Основные флаги: `-m` модель (`gigaam-v3` — по умолчанию/`gigaam-v3-rnnt`/`whisper-turbo`/`parakeet-v3`), `-d` устройство (`cuda`/`cpu`),

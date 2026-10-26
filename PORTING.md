@@ -239,11 +239,13 @@ ffmpeg shared, `deps/cuda13` и nvcc-сборку whisper.cpp — делать m
 
 ## Статус
 
-- [ ] Фаза 1 — `POST /v1/transcribe` + graceful shutdown + лимиты
-- [ ] Многоканальный вход: каналы как спикеры (CLI + HTTP)
-- [ ] Фаза 2 — `/health` `/readyz` `/metrics`
-- [ ] Фаза 3 — манифесты моделей (sha256 + IO-проверка)
-- [ ] Фаза 4 — выбор EP + верификация CUDA-назначений
-- [ ] Фаза 5 — CLI `bench`, `vad`
-- [ ] Фаза 6 — WebSocket-стриминг (MVP mono/ctc/words)
-- [ ] Фаза 7 — Docker
+- [x] Фаза 1 — `POST /v1/transcribe` + graceful shutdown + лимиты
+- [x] Многоканальный вход: каналы как спикеры (CLI + HTTP)
+- [x] Фаза 2 — `/health` `/readyz` `/metrics`
+- [x] Фаза 3 — манифесты моделей (sha256 + IO-проверка)
+- [x] Фаза 4 — выбор EP + верификация CUDA-назначений
+  (референсные отпечатки этой машины: CTC `b99c5fae…`, RNNT `a9c3729a…`,
+  ORT 1.29 + istupakov gigaam-v3 — совпали с источником)
+- [x] Фаза 5 — CLI `bench`, `vad`
+- [ ] Фаза 6 — WebSocket-стриминг (MVP mono/ctc/words) — требуется отдельное решение
+- [ ] Фаза 7 — Docker (опционально)

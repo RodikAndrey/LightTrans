@@ -11,12 +11,16 @@
 
 ## Что это
 
-`lighttrans` — одиночный Rust-бинарник (crate `lighttrans`, `src/main.rs`):
-GPU-транскрибация аудио/видео по схеме WhisperX. Один стриминговый конвейер,
+`lighttrans` — Rust-проект (crate `lighttrans`) с двумя бинарниками: CLI
+`lighttrans` (`src/main.rs`) и HTTP-сервис `lighttrans-server`
+(`src/bin/`). Один стриминговый конвейер (общий, в библиотечных модулях),
 четыре сменных бэкенда распознавания (GigaAM v3 CTC/RNN-T, Whisper Turbo,
 Parakeet TDT v3), вокруг них — VAD, чанкер, диаризация, шумоподавление,
-форс-выравнивание и запись результатов. Сервисного слоя (HTTP/очереди) нет:
-CLI-инструмент «файл(ы) на вход — файлы на выход».
+форс-выравнивание и запись результатов. CLI — «файл(ы) на вход — файлы на
+выход», плюс подкоманды `vad` (интервалы речи) и `bench` (этапы и RTF);
+сервер — batch-`POST /v1/transcribe` (GigaAM v3), метрики Prometheus,
+graceful shutdown. HTTP-слой портирован из gigaam-v3-runtime — контракт и
+проверенные критерии в [PORTING.md](PORTING.md).
 
 ## Ключевые команды
 
@@ -24,7 +28,8 @@ CLI-инструмент «файл(ы) на вход — файлы на вых
 source scripts/env.sh              # ОБЯЗАТЕЛЬНО и для сборки, и для запуска
 scripts/build.sh [cargo-аргументы] # cargo fetch + патч whisper DTW + cargo build --release
 cargo check                        # быстрая проверка компиляции (после source env.sh)
-scripts/run.sh video.mp4 -m gigaam-v3 -o out      # запуск
+scripts/run.sh video.mp4 -m gigaam-v3 -o out      # CLI-запуск
+./target/release/lighttrans-server --port 9898   # HTTP-сервис (после build)
 RUST_LOG=debug scripts/run.sh ...                 # подробные логи (по умолчанию info)
 ```
 
@@ -39,8 +44,16 @@ RUST_LOG=debug scripts/run.sh ...                 # подробные логи 
 
 ```
 src/
-├── main.rs         — CLI (clap, struct Args), сборка конвейера: продюсер-поток → очередь → N GPU-воркеров → слияние; фазы --w2v и --diarize; вывод
-├── audio.rs        — libav* декод: любой файл → поток блоков mono f32 (16 кГц; 48 кГц при --denoise)
+├── main.rs         — CLI (clap): транскрибация + подкоманды `vad`/`bench`; сборка конвейера; фазы --w2v и --diarize; вывод
+├── lib.rs          — библиотечный корень: общий код CLI и сервера
+├── pipeline.rs     — общий конвейер CLI и сервера: WorkerPool (очередь + ответы по чанкам), MultiStream (mix/split-каналы), отмена
+├── worker.rs       — ModelKind + сборка воркеров (try_build_worker), авто-подбор по VRAM (NVML)
+├── channels.rs     — «канал = спикер»: корреляция каналов, dual-mono (>0.98), turns по паузам
+├── server/         — HTTP-слой lighttrans-server (axum): /v1/transcribe, admission/draining, строгие env-лимиты, query-грамматика, health/readyz/metrics
+├── metrics.rs      — счётчики/гистограммы Prometheus (lighttrans_*)
+├── manifest.rs     — манифесты моделей: sha256+размер файлов, IO-имена ONNX (strict, если есть)
+├── ort_assignment.rs — инспекция назначения узлов ORT (API-24): CPU/CUDA-отпечатки, политика verified/allow-unverified
+├── audio.rs        — libav* декод: файл/байты/reader → поток блоков mono f32 (16 кГц; 48 кГц при --denoise; все каналы при split)
 ├── mel.rs          — log-mel 64×T, бит-в-бит как torchaudio MelSpectrogram (n_fft 320 / hop 160 / HTK)
 ├── vad.rs          — Silero v5 ONNX (CPU), стриминг, батчи по 64 окна, гистерезис WhisperX (onset/offset 0.5/0.363)
 ├── segments.rs     — стриминг-чанкер (≤ chunk_size, семантика merge_chunks WhisperX); здесь же фикс хвоста декодера
@@ -51,14 +64,16 @@ src/
 ├── align.rs        — форс-выравнивание слов CTC-моделью GigaAM (Viterbi по эмиссиям) — фаза --w2v
 ├── diarize.rs      — Nemotron-3-Diarization ONNX: mel-128, AOSC-кэш (порт из HF transformers)
 ├── df.rs           — DeepFilterNet 3 шумоподавление (крейт deep_filter/tract, модель вшита)
-├── transcript.rs   — общие типы результата всех бэкендов (схема WhisperX)
+├── transcript.rs   — общие типы результата всех бэкендов (схема WhisperX; channel/turns для многоканальности)
 ├── output.rs       — запись json/srt/vtt/tsv/txt
-├── models.rs       — резолв путей к моделям (--models-dir → ./models → рядом с exe)
-└── stats.rs        — реестр этапов + сводная таблица в конце запуска
+├── models.rs       — резолв путей к моделям (--models-dir → ./models → рядом с exe) + верификация манифестов
+└── stats.rs        — реестр этапов + сводная таблица/машиночитаемый json в конце запуска
 
-scripts/            — build.sh, run.sh, env.sh, patch_whisper_dtw.sh, export_nemotron_diar.py, export_w2v_align.py
+src/bin/lighttrans-server.rs — HTTP-сервис: загрузка пулов GigaAM, --ep без fallback, draining по SIGTERM
+
+scripts/            — build.sh, run.sh, env.sh, patch_whisper_dtw.sh, gen_model_manifest.py, export_nemotron_diar.py, export_w2v_align.py
 tests/              — генераторы эталонов (*.py), эталонные ref_*.py (torch/transformers), фикстуры, бенч-логи
-models/             — веса (в git НЕ хранятся, см. README «Модели»)
+models/             — веса (в git НЕ хранятся, см. README «Модели»); манифесты manifest.json коммитятся
 deps/               — cuda13 runtime, ffmpeg 9 shared, референсы (в git НЕ хранится)
 ```
 
@@ -66,7 +81,8 @@ deps/               — cuda13 runtime, ffmpeg 9 shared, референсы (в 
 
 Потоковая схема (как в WhisperX, но на потоках, не на процессах):
 
-1. **Продюсер** (`main.rs`, один поток): `audio::decode_streaming` → (опц. `df::StripPool`,
+1. **Продюсер** (`main.rs` в CLI, `server/http.rs` в сервере; один поток):
+   `audio::decode_streaming` → (опц. `df::StripPool`,
    полосы 2 минуты параллельно) → `vad::SileroVad::feed` → `segments::Chunker::feed`
    → готовые чанки в `chunk_tx`.
 2. **N GPU-воркеров** берут чанки из очереди; число задаёт `--workers` (0 = авто по
@@ -134,6 +150,20 @@ deps/               — cuda13 runtime, ffmpeg 9 shared, референсы (в 
 6. **Пороги VAD** (0.5/0.363, min_duration 0.1 c) повторяют WhisperX/pyannote —
    это осознанная совместимость; тихие начала фраз VAD может съедать (known
    trade-off), менять — только с прогоном `check_word_timing.py`.
+7. **Teardown ORT/CUDA роняет процесс.** Разрушение нескольких тёплых ONNX-сессий
+   при выходе периодически даёт segfault (гонка на общем CUDA-контексте).
+   `lighttrans-server` поэтому завершается через `std::process::exit()` **без
+   дропа** сессий — это сознательно, не убирайте exit и не добавляйте graceful
+   Drop путей для тёплого стейта.
+8. **Fallback провайдера запрещён в сервере.** `lighttrans-server --ep cuda`
+   собирает CUDA EP с `error_on_failure` и без ветки «переключиться на CPU»:
+   недоступный CUDA — отказ старта (Фаза 4 PORTING.md). CLI сохраняет старое
+   поведение (CUDA → CPU fallback) — это различие осознанное.
+9. **Манифесты моделей строгие.** Если рядом с семьёй моделей лежит
+   `manifest.json`, любое расхождение (файл, sha256, IO-имена ONNX) отказывает
+   загрузку; для RNN-T `io` — объединённая поверхность encoder+decoder+joint,
+   сверяется одним вызовом. Пересобирайте манифесты
+   `scripts/gen_model_manifest.py` при обновлении весов или ONNX-экспорта.
 
 ## Git
 
