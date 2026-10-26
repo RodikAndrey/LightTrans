@@ -9,6 +9,24 @@
 
 ### Added
 
+- Многоканальный вход «каждый канал — отдельный спикер» (перенос из gigaam-v3-runtime,
+  см. PORTING.md): `--split-channels` распознаёт каналы раздельно (раздельные VAD/чанкер),
+  слова и сегменты получают поля `channel` и метки `SPEAKER_0N`; dual-mono-источники
+  (корреляция каналов > 0.98) схлопываются в канал 0. `--turns`/`--turn-gap S` строят
+  реплики диалога: разрыв ≥ `turn-gap` внутри канала режет реплику, реплики
+  упорядочены по (start, channel); в txt/json — строки `[channel N]`.
+  Флаги конфликтуют с `--diarize` (канал уже задаёт спикера) и `--denoise` (v1).
+- `lighttrans-server` — HTTP-сервис (новый бинарь, CLI не тронут): `POST /v1/transcribe`
+  с телом = сырые байты аудио (декод из памяти через custom AVIO) и строгим query
+  (`model=gigaam-v3|gigaam-v3-rnnt`, `ext`, `words`, `segments`, `turns`, `turn_gap`,
+  `channels=split`); ответ `duration_sec/sample_rate_in/channels/dual_mono/model/rtf`
+  + одна текстовая проекция (`text` или `channels_text`) и опциональные
+  `words`/`segments`/`turns`; ошибки `{"error": ...}`: 400 (вход/домен),
+  413 (тело), 503 (перегрузка/draining/очередь >60 c), 504 (дедлайн);
+  `x-request-id` на каждом ответе. Тёплый стейт: ONNX-сессии создаются один раз
+  (пул воркеров на модель), на запрос — не создаются. Лимиты окружением
+  `ASR_MAX_CONCURRENCY`/`ASR_BODY_LIMIT_MB`/`ASR_REQ_TIMEOUT_SEC` (кривое значение
+  отказывает, не подменяется); SIGTERM/SIGINT → draining (новые 503, активные дожидаются).
 - `AGENTS.md` — путеводитель по проекту для агентов: структура, команды сборки/запуска,
   инварианты конвейера, соглашения кода, тесты и известные ловушки.
 - `CHANGELOG.md` — этот файл.

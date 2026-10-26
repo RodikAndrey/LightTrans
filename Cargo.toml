@@ -7,6 +7,9 @@ description = "Fast GPU audio/video transcription (WhisperX-style pipeline) in R
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# сервер (фазы 1-2 PORTING.md): стек как у источника (crates/service/Cargo.toml)
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 ffmpeg-next = "9.0.0"
 nvml-wrapper = "0.10"
 ort = { version = "=2.0.0-rc.13", features = ["cuda", "half"] }
@@ -27,6 +30,7 @@ ndarray = "0.15"
 rubato = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 whisper-rs = { version = "0.16.0", features = ["cuda", "raw-api"] }
@@ -34,3 +38,7 @@ whisper-rs = { version = "0.16.0", features = ["cuda", "raw-api"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[[bin]]
+name = "lighttrans-server"
+path = "src/bin/lighttrans-server.rs"

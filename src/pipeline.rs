@@ -6,12 +6,13 @@
 //! воркеров и количества параллельных запросов.
 
 use crate::channels::{channel_correlation, select_channels, ChannelPlan};
+use crate::metrics::Metrics;
 use crate::segments::{Chunk, Chunker};
 use crate::transcript::Segment;
 use crate::vad::SileroVad;
 use crate::worker::Worker;
 use anyhow::{Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
@@ -72,6 +73,8 @@ pub struct WorkerOpts {
     pub translate: bool,
     pub beam_size: usize,
     pub n_threads: usize,
+    /// Метрики сервера (CLI передаёт None).
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// Пул GPU-воркеров с общей очередью чанков. Ответы развозятся по
@@ -80,6 +83,10 @@ pub struct WorkerOpts {
 pub struct WorkerPool {
     chunk_tx: Mutex<Option<mpsc::Sender<QueueItem>>>,
     _handles: Vec<std::thread::JoinHandle<()>>,
+    metrics: Option<Arc<Metrics>>,
+    /// Живые воркеры (поток, умерший от паники, уменьшает счётчик).
+    alive: Arc<AtomicUsize>,
+    expected: usize,
 }
 
 impl WorkerPool {
@@ -89,42 +96,65 @@ impl WorkerPool {
     pub fn start(mut workers: Vec<Worker>, opts: WorkerOpts) -> Self {
         let (chunk_tx, chunk_rx) = mpsc::channel::<QueueItem>();
         let chunk_rx = Arc::new(Mutex::new(chunk_rx));
-        let mut handles = Vec::with_capacity(workers.len());
+        let expected = workers.len();
+        let alive = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(expected);
         while let Some(mut w) = workers.pop() {
             let rx = Arc::clone(&chunk_rx);
             let language = opts.language.clone();
             let translate = opts.translate;
             let beam = opts.beam_size;
             let nthr = opts.n_threads;
-            handles.push(std::thread::spawn(move || loop {
-                let item = { rx.lock().unwrap().recv() };
-                let Ok(item) = item else { break };
-                // чанк отменённого запроса выбрасываем без инференса
-                if item.cancel.cancelled() {
-                    continue;
+            let metrics = opts.metrics.clone();
+            alive.fetch_add(1, Ordering::SeqCst);
+            handles.push(std::thread::spawn({
+                let alive = Arc::clone(&alive);
+                move || {
+                    let _guard = AliveGuard(alive);
+                    loop {
+                        let item = { rx.lock().unwrap().recv() };
+                        let Ok(item) = item else { break };
+                        // чанк отменённого запроса выбрасываем без инференса
+                        if item.cancel.cancelled() {
+                            if let Some(m) = &metrics {
+                                m.chunk_replied();
+                            }
+                            continue;
+                        }
+                        let t_inf = Instant::now();
+                        let res = w.transcribe(
+                            &item.chunk.samples,
+                            item.chunk.start,
+                            &language,
+                            translate,
+                            beam,
+                            nthr,
+                        );
+                        let secs = t_inf.elapsed().as_secs_f64();
+                        crate::stats::add("инференс", &item.chunk.stats_label, secs);
+                        if let Some(m) = &metrics {
+                            m.observe_inference(secs);
+                            m.chunk_replied();
+                        }
+                        let _ = item.reply.send(ChunkOutcome { chunk: item.chunk, result: res });
+                    }
                 }
-                let t_inf = Instant::now();
-                let res = w.transcribe(
-                    &item.chunk.samples,
-                    item.chunk.start,
-                    &language,
-                    translate,
-                    beam,
-                    nthr,
-                );
-                crate::stats::add(
-                    "инференс",
-                    &item.chunk.stats_label,
-                    t_inf.elapsed().as_secs_f64(),
-                );
-                let _ = item.reply.send(ChunkOutcome { chunk: item.chunk, result: res });
             }));
         }
-        Self { chunk_tx: Mutex::new(Some(chunk_tx)), _handles: handles }
+        Self {
+            chunk_tx: Mutex::new(Some(chunk_tx)),
+            _handles: handles,
+            metrics: opts.metrics.clone(),
+            alive: Arc::clone(&alive),
+            expected,
+        }
     }
 
     /// Поставить чанк в очередь. `false` — пул закрыт (все воркеры умерли).
     pub fn submit(&self, item: QueueItem) -> bool {
+        if let Some(m) = &self.metrics {
+            m.chunk_submitted();
+        }
         match self.chunk_tx.lock().unwrap().as_ref() {
             Some(tx) => tx.send(item).is_ok(),
             None => false,
@@ -133,12 +163,26 @@ impl WorkerPool {
 
     /// Число воркеров пула (для /readyz).
     pub fn len(&self) -> usize {
-        self._handles.len()
+        self.expected
+    }
+
+    /// Часть воркеров умерла (паника в инференсе): готовность нарушена.
+    pub fn is_stopped(&self) -> bool {
+        self.alive.load(Ordering::SeqCst) < self.expected
     }
 
     /// Закрыть очередь: воркеры доработают активные чанки и завершатся.
     pub fn close(&self) {
         self.chunk_tx.lock().unwrap().take();
+    }
+}
+
+/// Уменьшает счётчик живых воркеров при выходе из потока (штатном или панике).
+struct AliveGuard(Arc<AtomicUsize>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

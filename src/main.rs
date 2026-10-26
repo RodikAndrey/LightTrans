@@ -422,6 +422,7 @@ fn main() -> Result<()> {
             translate,
             beam_size: args.beam_size,
             n_threads: if use_cuda { 4 } else { cores },
+            metrics: None,
         },
     ));
     let (reply_tx, reply_rx) = mpsc::channel::<ChunkOutcome>();
