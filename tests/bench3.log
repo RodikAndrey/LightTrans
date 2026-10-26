@@ -1,0 +1,9 @@
+[2m2026-09-28T10:50:59.839023Z[0m [32m INFO[0m воркеров: 3 (CUDA), intra-потоков на воркер: 4
+[2m2026-09-28T10:51:00.141728Z[0m [32m INFO[0m decoding [3mfile[0m[2m=[0mpsychodrama_5min.mp4 [3mcontainer[0m[2m=[0mmov,mp4,m4a,3gp,3g2,mj2 [3mcodec[0m[2m=[0m? [3mcontainer_duration_s[0m[2m=[0m"300.0"
+[aac @ 0000019f24633300] Could not update timestamps for skipped samples.
+[2m2026-09-28T10:51:00.144863Z[0m [31mERROR[0m Non-zero status code returned while running If node. Name:'If_0' Status Message: if.cc:296 onnxruntime::If::Compute If nodes condition input must have exactly one element
+Error: декодирование
+
+Caused by:
+    0: VAD inference
+    1: Non-zero status code returned while running If node. Name:'If_0' Status Message: if.cc:296 onnxruntime::If::Compute If nodes condition input must have exactly one element

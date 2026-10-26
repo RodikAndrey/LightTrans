@@ -1,0 +1,14 @@
+/target
+deps/
+
+# модели и веса в git не хранятся (скачиваются по README, «Модели»)
+models/**/*.bin
+models/**/*.onnx
+models/**/*.onnx.data
+models/**/*.safetensors
+
+# сгенерированные тест-фикстуры (воспроизводятся скриптами tests/*.py)
+tests/*.mp3
+tests/*.wav
+tests/*.mp4
+tests/*.npy

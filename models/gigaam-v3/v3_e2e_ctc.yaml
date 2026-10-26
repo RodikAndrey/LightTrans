@@ -1,0 +1,39 @@
+model_class: ctc
+sample_rate: 16000
+preprocessor:
+  _target_: gigaam.preprocess.FeatureExtractor
+  sample_rate: 16000
+  features: 64
+  win_length: 320
+  hop_length: 160
+  mel_scale: htk
+  n_fft: 320
+  mel_norm: null
+  center: false
+encoder:
+  _target_: gigaam.encoder.ConformerEncoder
+  feat_in: 64
+  n_layers: 16
+  d_model: 768
+  subsampling: conv1d
+  subs_kernel_size: 5
+  subsampling_factor: 4
+  ff_expansion_factor: 4
+  self_attention_model: rotary
+  pos_emb_max_len: 5000
+  n_heads: 16
+  conv_kernel_size: 5
+  flash_attn: false
+  conv_norm_type: layer_norm
+head:
+  _target_: gigaam.decoder.CTCHead
+  feat_in: 768
+  num_classes: 257
+decoding:
+  _target_: gigaam.decoding.CTCGreedyDecoding
+  vocabulary: null
+  model_path: /home/vscode/.cache/gigaam/v3_e2e_ctc_tokenizer.model
+model_name: v3_e2e_ctc
+hashes:
+  model: c15fd0dbca70363a146016d197ee0e2a
+  tokenizer: 2a9cd0c246db42d076e92abb31055deb

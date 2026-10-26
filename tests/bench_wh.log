@@ -1,0 +1,126 @@
+whisper_init_from_file_with_params_no_state: loading model from 'F:\LightTrans\models\ggml-large-v3-turbo.bin'
+whisper_init_with_params_no_state: use gpu    = 1
+whisper_init_with_params_no_state: flash attn = 1
+whisper_init_with_params_no_state: gpu_device = 0
+whisper_init_with_params_no_state: dtw        = 0
+ggml_cuda_init: found 1 CUDA devices:
+  Device 0: NVIDIA GeForce RTX 3060 Laptop GPU, compute capability 8.6, VMM: yes
+register_backend: registered backend CUDA (1 devices)
+register_device: registered device CUDA0 (NVIDIA GeForce RTX 3060 Laptop GPU)
+register_backend: registered backend CPU (1 devices)
+register_device: registered device CPU (Intel(R) Xeon(R) CPU E5-2678 v3 @ 2.50GHz)
+whisper_init_with_params_no_state: devices    = 2
+whisper_init_with_params_no_state: backends   = 2
+whisper_model_load: loading model
+whisper_model_load: n_vocab       = 51866
+whisper_model_load: n_audio_ctx   = 1500
+whisper_model_load: n_audio_state = 1280
+whisper_model_load: n_audio_head  = 20
+whisper_model_load: n_audio_layer = 32
+whisper_model_load: n_text_ctx    = 448
+whisper_model_load: n_text_state  = 1280
+whisper_model_load: n_text_head   = 20
+whisper_model_load: n_text_layer  = 4
+whisper_model_load: n_mels        = 128
+whisper_model_load: ftype         = 1
+whisper_model_load: qntvr         = 0
+whisper_model_load: type          = 5 (large v3)
+whisper_model_load: adding 1609 extra tokens
+whisper_model_load: n_langs       = 100
+whisper_model_load:        CUDA0 total size =  1623.92 MB
+whisper_model_load: model size    = 1623.92 MB
+whisper_backend_init_gpu: device 0: CUDA0 (type: 1)
+whisper_backend_init_gpu: found GPU device 0: CUDA0 (type: 1, cnt: 0)
+whisper_backend_init_gpu: using CUDA0 backend
+whisper_init_state: kv self size  =   10.49 MB
+whisper_init_state: kv cross size =   31.46 MB
+whisper_init_state: kv pad  size  =    7.86 MB
+whisper_init_state: compute buffer (conv)   =   37.69 MB
+whisper_init_state: compute buffer (encode) =   55.35 MB
+whisper_init_state: compute buffer (cross)  =    9.27 MB
+whisper_init_state: compute buffer (decode) =  100.04 MB
+[2m2026-09-28T11:00:28.554655Z[0m [32m INFO[0m 1 воркеров (CUDA), intra-потоков на воркер: 8, загрузка 2.0s
+[2m2026-09-28T11:00:28.849466Z[0m [32m INFO[0m decoding [3mfile[0m[2m=[0mpsychodrama_5min.mp4 [3mcontainer[0m[2m=[0mmov,mp4,m4a,3gp,3g2,mj2 [3mcodec[0m[2m=[0m? [3mcontainer_duration_s[0m[2m=[0m"300.0"
+[aac @ 000002e2a87d8740] Could not update timestamps for skipped samples.
+[2m2026-09-28T11:00:29.156259Z[0m [32m INFO[0m декодировано 60с...
+[2m2026-09-28T11:00:29.410858Z[0m [32m INFO[0m декодировано 120с...
+[2m2026-09-28T11:00:29.646981Z[0m [32m INFO[0m декодировано 180с...
+[2m2026-09-28T11:00:29.873602Z[0m [32m INFO[0m декодировано 240с...
+[2m2026-09-28T11:00:30.105157Z[0m [32m INFO[0m декодировано 300с...
+[2m2026-09-28T11:00:30.105331Z[0m [32m INFO[0m декод завершён [0]: 300.0с аудио за 1.29с (RTF декода 0.004)
+[2m2026-09-28T11:00:30.105408Z[0m [32m INFO[0m файл [0] отправлен в очередь
+saved: out_whisper\psychodrama_5min.txt, out_whisper\psychodrama_5min.json
+--- psychodrama_5min.mp4 ---
+Так по мурам походи.
+Что такое человек?
+Человек - это вот такая пирамидка.
+И многие уже от меня слышали столько раз,
+кто срабатывает рефлекс, это я уже знаю,
+что бы манажнил от одного и того,
+отворачивается.
+А вы все равно послушайте,
+потому что всё равно что-то новое услышать.
+Человека можно представить в виде пирамидки, состоящей из пяти уровней.
+Нижний уровень — это тело, затем чувства, затем личность, знания, состояние.
+категорий, которые определяют человек. Они все всегда есть в человеке. То есть человек не состоит из какого-то одного слоя, он из всех пяти состоит.
+Больше в человеке нет ничего, если человек живет в мире с открытыми глазами. Когда он закрывает глаза,
+продается медитация или спит на подушке, там возникают еще другие
+параметры и категории.
+Но мы говорим сейчас о мире с открытыми глазами.
+Вот я сразу вношу ограничения.
+Пять категорий.
+Можете предположить или внести на рассмотрение что-то,
+что с вашей точки зрения не является телом, чувством,
+личностью, знанием или состоянием?
+Не спешите.
+и подумайте.
+То есть то, что у нас есть тело, это бесспорно, его
+можно пощупать.
+То, что у нас есть чувства, тоже никто спорить не будет.
+Что у нас есть личность, об этом всё время говорят,
+наверное, есть, но у кого-то встречается.
+Знания – это то, что мы получаем в процессе освоения
+этого мира, то есть это приобретённые знания, есть врождённые
+знания.
+Их иногда ещё называют инстинктами, иногда называют
+кармическое.
+памяти.
+Ну, в общем, так или иначе мы несем себе кучу информации.
+И состояние – это то, что сложнее всего поделить,
+но это то, о чем мы говорим обычно в терминах настроения.
+Настроение – это не чувство.
+Но определять состояние сложно, потому что по законам
+здравого смысла для того, чтобы что-то определить,
+надо оказаться над этим.
+А поскольку состояние – вершинка пирамиды, то оценивать
+Состояние очень сложное.
+Как вы думаете, за счет чего мы можем все-таки оценивать состояние?
+Если выше, чем состояние, нам ничего не дано.
+За счет рефлексии от другого человека, от мира, от мира, от мира.
+Мы, может, и все равно будем делать состояние?
+Воспоминаниями потом.
+Воспоминания тоже нас повергают состояние.
+Ощущение.
+Ощущение чувств.
+Ощущение, это всего лишь ощущение.
+ощущением
+Материя, ощущения, чувства, ощущения, личность, ощущения, знания, ощущения, состояние.
+Все, что нам дано, это ощущения.
+Про какие ощущения вы говорите?
+Мы же его узнаем, внутреннее состояние.
+Мы можем оценивать другие состояния, только исходя из других состояний, более высоких.
+То есть внутри состояний существует своя иерархия.
+И более низкие состояния мы можем оценивать из более высоких состояний.
+Например, если вы спокойны, вы можете оценить, что 3 минуты назад вы были в памяти.
+А когда вы в панике, вы ничего оценить не можете.
+Паника более низкое состояние, чем состояние здравомысля,
+скажем так.
+То есть за счет того, что внутри этих состояний тоже
+существует своя градация, из более высоких состояний
+мы можем оценить более низкие и судить о них.
+Но мы не можем судить о более высоких состояниях.
+Итак.
+Какая бессознательная укладывается пирамид?
+Продолжение следует...
+Когда мы живем в мире с открытыми глазами, бессознательное не проявлено.
+[2m2026-09-28T11:00:42.579828Z[0m [32m INFO[0m всего чанков обработано: 10

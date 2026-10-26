@@ -1,0 +1,62 @@
+[
+ {
+  "word": "apple",
+  "start": 0.7,
+  "end": 1.2596875
+ },
+ {
+  "word": "banana",
+  "start": 1.7,
+  "end": 2.3499375
+ },
+ {
+  "word": "computer",
+  "start": 2.7,
+  "end": 3.5063750000000002
+ },
+ {
+  "word": "elephant",
+  "start": 3.7,
+  "end": 4.4520625
+ },
+ {
+  "word": "guitar",
+  "start": 4.7,
+  "end": 5.344875
+ },
+ {
+  "word": "ocean",
+  "start": 5.7,
+  "end": 6.3299375
+ },
+ {
+  "word": "planet",
+  "start": 6.7,
+  "end": 7.2759375
+ },
+ {
+  "word": "rocket",
+  "start": 7.7,
+  "end": 8.377375
+ },
+ {
+  "word": "window",
+  "start": 8.7,
+  "end": 9.305937499999999
+ },
+ {
+  "word": "forest",
+  "start": 9.7,
+  "end": 10.356937499999999
+ },
+ {
+  "word": "market",
+  "start": 10.7,
+  "end": 11.369625
+ },
+ {
+  "word": "silver",
+  "start": 11.7,
+  "end": 12.363187499999999
+ }
+]

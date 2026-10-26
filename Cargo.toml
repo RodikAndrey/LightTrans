@@ -1,0 +1,36 @@
+[package]
+name = "lighttrans"
+version = "0.1.0"
+edition = "2021"
+description = "Fast GPU audio/video transcription (WhisperX-style pipeline) in Rust: GigaAM v3 E2E CTC + Whisper Large v3 Turbo"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ffmpeg-next = "9.0.0"
+nvml-wrapper = "0.10"
+ort = { version = "=2.0.0-rc.13", features = ["cuda", "half"] }
+half = "2"
+realfft = "3"
+# DeepFilterNet 3 (libDF): шумоподавление, модель DFN3 вшита через feature default-model
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", default-features = false, features = [
+    "tract",
+    "default-model",
+] }
+# libDF собран под tract 0.21.4 (ndarray 0.15); более новые 0.21.x несовместимы —
+# запинено, как в Cargo.lock upstream-репозитория
+tract-core = "=0.21.4"
+tract-onnx = "=0.21.4"
+tract-pulse = "=0.21.4"
+tract-hir = "=0.21.4"
+ndarray = "0.15"
+rubato = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+whisper-rs = { version = "0.16.0", features = ["cuda", "raw-api"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

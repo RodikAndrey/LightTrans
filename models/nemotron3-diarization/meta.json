@@ -1,0 +1,22 @@
+{
+  "sampling_rate": 16000,
+  "n_fft": 512,
+  "win_length": 400,
+  "hop_length": 160,
+  "n_mels": 128,
+  "preemphasis": 0.97,
+  "log_zero_guard": 5.960464477539063e-08,
+  "num_speakers": 8,
+  "subsampling_factor": 8,
+  "chunk_length": 340,
+  "chunk_right_context": 40,
+  "fifo_length": 40,
+  "speaker_cache_length": 264,
+  "speaker_cache_update_period": 300,
+  "speaker_cache_silence_frames_per_speaker": 1,
+  "prediction_score_threshold": 0.25,
+  "latest_frames_score_boost": 0.05,
+  "min_positive_scores_rate": 0.5,
+  "strong_boost_rate": 0.75,
+  "weak_boost_rate": 1.5
+}
