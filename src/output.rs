@@ -58,7 +58,20 @@ pub fn write_outputs(
         let path = stem.with_extension(f.ext());
         let mut file = std::fs::File::create(&path)?;
         match f {
-            OutFormat::Txt => write!(file, "{}\n", t.text())?,
+            OutFormat::Txt => {
+                // в режиме диалога txt — реплики с каналами, иначе сегменты
+                if t.turns.is_empty() {
+                    write!(file, "{}\n", t.text())?;
+                } else {
+                    let s = t
+                        .turns
+                        .iter()
+                        .map(|turn| format!("[channel {}] {}", turn.channel, turn.text))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    write!(file, "{s}\n")?;
+                }
+            }
             OutFormat::Srt => write_srt(&mut file, t)?,
             OutFormat::Vtt => write_vtt(&mut file, t)?,
             OutFormat::Tsv => write_tsv(&mut file, t)?,
@@ -71,11 +84,15 @@ pub fn write_outputs(
 
 fn write_json(file: &mut std::fs::File, t: &Transcript) -> Result<()> {
     let word_segments: Vec<&crate::transcript::Word> = t.words_flat();
-    let doc = serde_json::json!({
+    let mut doc = serde_json::json!({
         "language": t.language,
         "segments": t.segments,
         "word_segments": word_segments,
     });
+    // реплики диалога (только в режиме разделения каналов с --turns)
+    if !t.turns.is_empty() {
+        doc["turns"] = serde_json::to_value(&t.turns)?;
+    }
     serde_json::to_writer_pretty(&mut *file, &doc)?;
     writeln!(file)?;
     Ok(())

@@ -4,44 +4,25 @@
 //! batched) -> chunker -> N worker threads (GPU inference) -> ordered merge ->
 //! output writers. Worker count is auto-detected from free VRAM (CUDA) or CPU
 //! cores, or set explicitly with --workers.
-
-mod align;
-mod audio;
-mod df;
-mod diarize;
-mod gigaam;
-mod gigaam_rnnt;
-mod mel;
-mod parakeet;
-mod models;
-mod output;
-mod segments;
-mod stats;
-mod transcript;
-mod vad;
-mod whisper;
+//!
+//! Общая логика конвейера живёт в библиотечных модулях (`pipeline.rs`,
+//! `worker.rs` и др.): их использует и сервер (`lighttrans-server`).
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, ValueEnum};
-use segments::Chunker;
+use clap::{CommandFactory, Parser};
+use lighttrans::channels::ChannelWords;
+use lighttrans::pipeline::{
+    CancelToken, ChannelMode, ChunkOutcome, MultiStream, QueueItem, WorkerPool,
+};
+use lighttrans::segments::Chunk;
+use lighttrans::transcript::{join_word_texts, Segment, Transcript, Word};
+use lighttrans::worker::{auto_workers, try_build_worker, ModelKind, Worker};
+use lighttrans::{align, audio, channels, df, diarize, models, output, pipeline, stats, transcript};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use transcript::{join_word_texts, Segment, Transcript, Word};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ModelKind {
-    /// Whisper Large v3 Turbo (multilingual, ggml/whisper.cpp CUDA)
-    WhisperTurbo,
-    /// GigaAM v3 E2E CTC (Russian, ONNX Runtime CUDA, punctuation + ITN)
-    GigaamV3,
-    /// GigaAM v3 E2E RNN-T (Russian, ONNX Runtime CUDA, punctuation + ITN)
-    GigaamV3Rnnt,
-    /// Parakeet TDT 0.6B v3 (25 европейских языков, ONNX Runtime CUDA)
-    ParakeetV3,
-}
 
 #[derive(Parser)]
 #[command(
@@ -53,7 +34,8 @@ enum ModelKind {
     after_help = "Примеры:
   lighttrans video.mp4                        gigaam-v3, русский
   lighttrans talk.mkv -m whisper-turbo -l ru --w2v   пословные таймстампы
-  lighttrans rec.mp3 --diarize --denoise      спикеры + шумоподавление"
+  lighttrans rec.mp3 --diarize --denoise      спикеры + шумоподавление
+  lighttrans conf.wav --split-channels --turns  каждый канал — спикер, диалог"
 )]
 struct Args {
     /// Входные аудио/видео файлы
@@ -112,8 +94,20 @@ struct Args {
     output_format: String,
 
     /// разделение спикеров (Nemotron, до 8)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["split_channels", "turns"])]
     diarize: bool,
+
+    /// каждый канал входа — отдельный спикер (многоканальный диалог)
+    #[arg(long, conflicts_with = "denoise")]
+    split_channels: bool,
+
+    /// реплики диалога по каналам (подразумевает --split-channels)
+    #[arg(long)]
+    turns: bool,
+
+    /// пауза, режущая реплику в канале, с (--turns)
+    #[arg(long, default_value_t = 1.0)]
+    turn_gap: f64,
 
     /// пословные таймстампы GigaAM-CTC (whisper-turbo)
     #[arg(long, conflicts_with = "dtw")]
@@ -142,57 +136,6 @@ struct Args {
     /// показать справку и выйти
     #[arg(short = 'h', long)]
     help: bool,
-}
-
-/// Backend used by a single inference worker.
-enum Worker {
-    Whisper(whisper::WhisperTurbo, whisper_rs::WhisperState),
-    Gigaam(gigaam::GigaAmV3),
-    GigaamRnnt(gigaam_rnnt::GigaAmRnnt),
-    Parakeet(parakeet::ParakeetV3),
-}
-
-impl Worker {
-    fn warmup(&mut self) -> Result<()> {
-        let silence = vec![0.0f32; 16_000];
-        let (segs, _) = self.transcribe(&silence, 0.0, "en", false, 1, 4)?;
-        let _ = segs;
-        Ok(())
-    }
-
-    fn transcribe(
-        &mut self,
-        samples: &[f32],
-        offset: f64,
-        language: &str,
-        translate: bool,
-        beam_size: usize,
-        n_threads: usize,
-    ) -> Result<(Vec<Segment>, Option<String>)> {
-        match self {
-            Worker::Whisper(model, state) => {
-                let (segs, lang) = model.transcribe_chunk(
-                    state,
-                    samples,
-                    offset,
-                    &whisper::WhisperOpts { language, translate, beam_size, n_threads },
-                )?;
-                Ok((segs, Some(lang)))
-            }
-            Worker::Gigaam(g) => {
-                let seg = g.transcribe_chunk(samples, offset)?;
-                Ok((seg.map(|s| vec![s]).unwrap_or_default(), None))
-            }
-            Worker::GigaamRnnt(g) => {
-                let seg = g.transcribe_chunk(samples, offset)?;
-                Ok((seg.map(|s| vec![s]).unwrap_or_default(), None))
-            }
-            Worker::Parakeet(p) => {
-                let seg = p.transcribe_chunk(samples, offset)?;
-                Ok((seg.map(|s| vec![s]).unwrap_or_default(), None))
-            }
-        }
-    }
 }
 
 /// Печатает текст постранично, если терминал ниже текста: страница помещается
@@ -311,6 +254,15 @@ fn read_key() -> Option<char> {
     console::read_key()
 }
 
+/// Текст диалога: `[channel N] текст` на каждую реплику (как CLI источника).
+fn dialog_text(turns: &[transcript::Turn]) -> String {
+    turns
+        .iter()
+        .map(|t| format!("[channel {}] {}", t.channel, t.text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn main() -> Result<()> {
     // без аргументов или с -h/--help — компактная справка с постраничной
     // прокруткой, если она не влезает в экран
@@ -337,6 +289,9 @@ fn main() -> Result<()> {
         anyhow::bail!("translate доступен только для whisper-turbo");
     }
     let translate = args.task == "translate";
+    // --turns подразумевает раздельные каналы
+    let split_active = args.split_channels || args.turns;
+    channels::validate_turn_gap(args.turn_gap)?;
     if (args.w2v || args.dtw) && args.model != ModelKind::WhisperTurbo {
         tracing::warn!("ключи --w2v/--dtw применяются только к whisper-turbo — игнорирую");
     }
@@ -459,52 +414,24 @@ fn main() -> Result<()> {
         );
     }
 
-    // --- channels shared across all input files ---
-    let (chunk_tx, chunk_rx) = mpsc::channel::<segments::Chunk>();
-    // result: (file, chunk, segments, chunk samples + absolute start — the
-    // samples ride along for the deferred alignment phase and are dropped
-    // immediately when --w2v is off)
-    let (res_tx, res_rx) = mpsc::channel::<(
-        usize,
-        usize,
-        anyhow::Result<(Vec<Segment>, Option<String>)>,
-        Vec<f32>,
-        f64,
-    )>();
-    let chunk_rx = Arc::new(Mutex::new(chunk_rx));
-
-    let nthr = if use_cuda { 4 } else { cores };
-    let lang_arg = args.language.clone();
-    let beam = args.beam_size;
-    let file_names: Arc<Vec<String>> = Arc::new(
-        args.files
-            .iter()
-            .map(|f| f.display().to_string())
-            .collect(),
-    );
-    for mut w in workers_vec {
-        let rx = Arc::clone(&chunk_rx);
-        let tx = res_tx.clone();
-        let lang_arg = lang_arg.clone();
-        let file_names = Arc::clone(&file_names);
-        std::thread::spawn(move || loop {
-            let chunk = { rx.lock().unwrap().recv() };
-            let Ok(chunk) = chunk else { break };
-            let t_inf = Instant::now();
-            let res = w.transcribe(&chunk.samples, chunk.start, &lang_arg, translate, beam, nthr);
-            stats::add("инференс", &file_names[chunk.file_idx], t_inf.elapsed().as_secs_f64());
-            let _ = tx.send((chunk.file_idx, chunk.idx, res, chunk.samples, chunk.start));
-        });
-    }
-    drop(res_tx); // res_rx закроется, когда все воркеры завершатся
+    // --- worker pool: общая очередь чанков, ответы развозятся по чанкам ---
+    let pool = Arc::new(WorkerPool::start(
+        workers_vec,
+        pipeline::WorkerOpts {
+            language: args.language.clone(),
+            translate,
+            beam_size: args.beam_size,
+            n_threads: if use_cuda { 4 } else { cores },
+        },
+    ));
+    let (reply_tx, reply_rx) = mpsc::channel::<ChunkOutcome>();
+    let cancel = CancelToken::new();
 
     let n_files = args.files.len();
     let diar_results: Arc<Mutex<Vec<Option<anyhow::Result<diarize::Diarization>>>>> =
         Arc::new(Mutex::new((0..n_files).map(|_| None).collect()));
-    let mut transcripts: Vec<Transcript> = args
-        .files
-        .iter()
-        .map(|_| Transcript { language: String::new(), segments: Vec::new() })
+    let mut transcripts: Vec<Transcript> = (0..n_files)
+        .map(|_| Transcript::default())
         .collect();
     if args.model == ModelKind::GigaamV3 || args.model == ModelKind::GigaamV3Rnnt {
         for t in &mut transcripts {
@@ -522,10 +449,13 @@ fn main() -> Result<()> {
 
     // --- producer: decode -> [denoise] -> VAD -> chunker, sequentially over input files ---
     let producer = {
-        let chunk_tx = chunk_tx;
+        let pool = Arc::clone(&pool);
+        let reply_tx = reply_tx.clone();
+        let cancel = cancel.clone();
         let files = args.files.clone();
         let vad_path = paths.silero_vad.clone();
         let no_vad = args.no_vad;
+        let split_active = split_active;
         let denoise = args.denoise;
         let denoise_atten_lim = args.denoise_atten_lim;
         let denoise_threads = args.denoise_threads;
@@ -551,96 +481,146 @@ fn main() -> Result<()> {
                     .ok()
             });
             for (file_idx, file) in files.iter().enumerate() {
-                let mut vad = if no_vad {
-                    None
-                } else {
-                    Some(
-                        vad::SileroVad::load(&vad_path, 2)?
-                            .with_thresholds(vad_onset, vad_offset),
-                    )
-                };
-                let mut chunker = Chunker::new(file_idx, chunk_size, no_vad);
-                let mut intervals: Vec<vad::VadSegment> = Vec::new();
-                let mut collected: Vec<f32> = Vec::new();
                 let file_disp = file.display().to_string();
                 let _dec_span = stats::span("декодирование + VAD", Some(&file_disp));
                 let t_dec = Instant::now();
-                let mut feed_block = |block: &[f32]| -> Result<()> {
-                    if diarizer.is_some() {
-                        collected.extend_from_slice(block);
-                    }
-                    intervals.clear();
-                    if let Some(v) = vad.as_mut() {
-                        v.feed(block, &mut intervals).context("VAD inference")?;
-                    }
-                    let secs: Vec<(f64, f64)> =
-                        intervals.iter().map(|s| (s.start, s.end)).collect();
-                    let mut ready = Vec::new();
-                    chunker.feed(block, &secs, &mut ready);
-                    for c in ready {
-                        let _ = chunk_tx.send(c);
+                let mut ready: Vec<Chunk> = Vec::new();
+                // отправить готовый чанк в пул воркеров
+                let submit = |c: Chunk| {
+                    let ok = pool.submit(QueueItem {
+                        chunk: c,
+                        cancel: cancel.clone(),
+                        reply: reply_tx.clone(),
+                    });
+                    if !ok {
+                        anyhow::bail!("пул воркеров закрыт (воркеры погибли)");
                     }
                     Ok(())
                 };
-                // дамп очищенного потока + передача в VAD/чанкер
-                let mut emit16 = |out: &[f32]| -> Result<()> {
-                    if let Some(f) = dump_denoised_file.as_mut() {
-                        use std::io::Write;
-                        for s in out {
-                            let _ = f.write_all(&s.to_le_bytes());
-                        }
-                    }
-                    feed_block(out)
-                };
-                let dur =
-                    audio::decode_streaming(file, target_sr, target_sr as usize, |block| {
-                        match df_pool.as_mut() {
-                            Some(pool) => pool.feed(block, &mut emit16),
-                            None => emit16(block),
-                        }
-                    })
+                let dur: f64 = if split_active {
+                    // --- многоканальный путь: декод с сохранением каналов ---
+                    let mut dec = audio::Decoder::open_path(
+                        file,
+                        audio::TARGET_SR,
+                        0, // сохранить все каналы
+                        pipeline::SPLIT_BLOCK_FRAMES,
+                    )
                     .with_context(|| format!("декодирование {}", file.display()))?;
-                if let Some(pool) = df_pool.as_mut() {
-                    pool.finish(&mut emit16)?;
-                }
-                stats::set_audio(&file_disp, dur);
+                    let nch = dec.channels();
+                    let mut ms = MultiStream::new(
+                        ChannelMode::Split,
+                        file_idx,
+                        nch,
+                        file_disp.clone(),
+                        chunk_size,
+                        no_vad,
+                        vad_path.clone(),
+                        vad_onset,
+                        vad_offset,
+                    );
+                    let frames = dec.decode(|block| {
+                        ready.clear();
+                        ms.feed(block, &mut ready)?;
+                        for c in ready.drain(..) {
+                            submit(c)?;
+                        }
+                        Ok(())
+                    })?;
+                    ready.clear();
+                    ms.finish(&mut ready)?;
+                    for c in ready.drain(..) {
+                        submit(c)?;
+                    }
+                    let dur = frames as f64 / audio::TARGET_SR as f64;
+                    stats::set_audio(&file_disp, dur);
+                    if let Some(plan) = ms.plan() {
+                        tracing::info!(
+                            "каналы [{file_idx}]: исходных {}, выбрано {:?} (dual_mono={})",
+                            plan.source_channels,
+                            plan.selected,
+                            plan.dual_mono
+                        );
+                    }
+                    dur
+                } else {
+                    // --- обычный mono-путь (микширование в декодере) ---
+                    let mut ms = MultiStream::new(
+                        ChannelMode::Mix,
+                        file_idx,
+                        1,
+                        file_disp.clone(),
+                        chunk_size,
+                        no_vad,
+                        vad_path.clone(),
+                        vad_onset,
+                        vad_offset,
+                    );
+                    if diarizer.is_some() {
+                        ms = ms.with_mono_collection();
+                    }
+                    let mut feed_block = |block: &[f32]| -> Result<()> {
+                        ready.clear();
+                        ms.feed(block, &mut ready)?;
+                        for c in ready.drain(..) {
+                            submit(c)?;
+                        }
+                        Ok(())
+                    };
+                    // дамп очищенного потока + передача в VAD/чанкер
+                    let mut emit16 = |out: &[f32]| -> Result<()> {
+                        if let Some(f) = dump_denoised_file.as_mut() {
+                            use std::io::Write;
+                            for s in out {
+                                let _ = f.write_all(&s.to_le_bytes());
+                            }
+                        }
+                        feed_block(out)
+                    };
+                    let dur =
+                        audio::decode_streaming(file, target_sr, target_sr as usize, |block| {
+                            match df_pool.as_mut() {
+                                Some(pool) => pool.feed(block, &mut emit16),
+                                None => emit16(block),
+                            }
+                        })
+                        .with_context(|| format!("декодирование {}", file.display()))?;
+                    if let Some(pool) = df_pool.as_mut() {
+                        pool.finish(&mut emit16)?;
+                    }
+                    ready.clear();
+                    ms.finish(&mut ready)?;
+                    for c in ready.drain(..) {
+                        submit(c)?;
+                    }
+                    stats::set_audio(&file_disp, dur);
+                    if diarizer.is_some() {
+                        let collected = ms.take_mono();
+                        let dz = Arc::clone(diarizer.as_ref().unwrap());
+                        let diar_results = Arc::clone(&diar_results);
+                        let file_name = file_disp.clone();
+                        let dump = dump_diar.clone();
+                        diar_handles.push(std::thread::spawn(move || {
+                            let mut d = dz.lock().unwrap();
+                            let _g = stats::span("диаризация", Some(&file_name));
+                            let t0 = Instant::now();
+                            let res = d.diarize(&collected, dump.as_deref());
+                            tracing::info!(
+                                "диаризация [{file_name}]: {:.2}с аудио за {:.2}с",
+                                collected.len() as f64 / 16_000.0,
+                                t0.elapsed().as_secs_f64()
+                            );
+                            diar_results.lock().unwrap()[file_idx] = Some(res);
+                        }));
+                    }
+                    dur
+                };
                 tracing::info!(
                     "декод завершён [{file_idx}]: {:.1}с аудио за {:.2}с (RTF декода {:.3})",
                     dur,
                     t_dec.elapsed().as_secs_f64(),
                     if dur > 0.0 { t_dec.elapsed().as_secs_f64() / dur } else { 0.0 }
                 );
-                intervals.clear();
-                if let Some(v) = vad.as_mut() {
-                    v.finish(&mut intervals);
-                }
-                let secs: Vec<(f64, f64)> = intervals.iter().map(|s| (s.start, s.end)).collect();
-                let mut ready = Vec::new();
-                chunker.feed_intervals(&secs, &mut ready);
-                chunker.finish(&mut ready);
-                for c in ready {
-                    let _ = chunk_tx.send(c);
-                }
                 tracing::info!("файл [{file_idx}] отправлен в очередь");
-
-                if let Some(dz) = diarizer.as_ref() {
-                    let dz = Arc::clone(dz);
-                    let diar_results = Arc::clone(&diar_results);
-                    let file_name = file.display().to_string();
-                    let dump = dump_diar.clone();
-                    diar_handles.push(std::thread::spawn(move || {
-                        let mut d = dz.lock().unwrap();
-                        let _g = stats::span("диаризация", Some(&file_name));
-                        let t0 = Instant::now();
-                        let res = d.diarize(&collected, dump.as_deref());
-                        tracing::info!(
-                            "диаризация [{file_name}]: {:.2}с аудио за {:.2}с",
-                            collected.len() as f64 / 16_000.0,
-                            t0.elapsed().as_secs_f64()
-                        );
-                        diar_results.lock().unwrap()[file_idx] = Some(res);
-                    }));
-                }
             }
             for h in diar_handles {
                 if let Err(e) = h.join() {
@@ -650,25 +630,29 @@ fn main() -> Result<()> {
             Ok(())
         })
     };
-    // chunk_tx переехал в producer: чанк-канал закроется, когда producer
-    // закончит, и воркеры завершатся
+    // основная копия reply_tx больше не нужна: канал закроется, когда
+    // закончит producer и его клоны
+    drop(reply_tx);
 
-    // --- collect results ---
+    // --- collect results, строго по порядку (file_idx, channel, idx) ---
     let _collect_span = stats::span("сборка результатов", None);
-    let mut pending: BTreeMap<(usize, usize), (Vec<f32>, f64, Vec<Segment>)> = BTreeMap::new();
+    let mut pending: BTreeMap<(usize, usize, usize), (Vec<f32>, f64, Vec<Segment>)> = BTreeMap::new();
     let mut received = 0usize;
     let mut first_error: Option<anyhow::Error> = None;
-    for (file_idx, idx, res, samples, start) in res_rx {
+    for ChunkOutcome { chunk, result } in reply_rx {
         received += 1;
-        match res {
+        match result {
             Ok((segs, lang)) => {
-                let t = &mut transcripts[file_idx];
+                let t = &mut transcripts[chunk.file_idx];
                 if t.language.is_empty() {
                     if let Some(l) = lang {
                         t.language = l;
                     }
                 }
-                pending.insert((file_idx, idx), (samples, start, segs));
+                pending.insert(
+                    (chunk.file_idx, chunk.channel, chunk.idx),
+                    (chunk.samples, chunk.start, segs),
+                );
                 if received % 20 == 0 {
                     tracing::info!("обработано чанков: {received}");
                 }
@@ -724,9 +708,15 @@ fn main() -> Result<()> {
             v
         };
         let _align_span = stats::span("выравнивание (w2v)", None);
-        let (al_tx, al_rx) = mpsc::channel::<(usize, usize, Vec<Segment>)>();
+        let file_names: Arc<Vec<String>> = Arc::new(
+            args.files
+                .iter()
+                .map(|f| f.display().to_string())
+                .collect(),
+        );
+        let (al_tx, al_rx) = mpsc::channel::<(usize, usize, usize, Vec<Segment>)>();
         let al_rx = Arc::new(Mutex::new(al_rx));
-        let queue: Arc<Mutex<std::collections::VecDeque<((usize, usize), (Vec<f32>, f64, Vec<Segment>))>>> =
+        let queue: Arc<Mutex<std::collections::VecDeque<((usize, usize, usize), (Vec<f32>, f64, Vec<Segment>))>>> =
             Arc::new(Mutex::new(pending.into_iter().collect()));
         for al in aligners {
             let queue = Arc::clone(&queue);
@@ -734,34 +724,85 @@ fn main() -> Result<()> {
             let file_names = Arc::clone(&file_names);
             std::thread::spawn(move || loop {
                 let Some(item) = queue.lock().unwrap().pop_front() else { break };
-                let ((fi, idx), (samples, start, mut segs)) = item;
+                let (key, (samples, start, mut segs)) = item;
+                let (fi, ch, idx) = key;
                 let t_al = Instant::now();
                 if let Err(e) = al.lock().unwrap().align_chunk(&samples, start, &mut segs) {
                     tracing::warn!("выравнивание w2v не удалось: {e:#}");
                 }
-                stats::add("выравнивание w2v", &file_names[fi], t_al.elapsed().as_secs_f64());
+                stats::add(
+                    "выравнивание w2v",
+                    &format!("{}#ch{ch}", file_names[fi]),
+                    t_al.elapsed().as_secs_f64(),
+                );
                 drop(samples);
-                let _ = tx.send((fi, idx, segs));
+                let _ = tx.send((fi, ch, idx, segs));
             });
         }
         drop(al_tx);
-        let mut aligned: BTreeMap<(usize, usize), Vec<Segment>> = BTreeMap::new();
+        let mut aligned: BTreeMap<(usize, usize, usize), Vec<Segment>> = BTreeMap::new();
         {
             let rx = al_rx.lock().unwrap();
-            while let Ok((fi, idx, segs)) = rx.recv() {
-                aligned.insert((fi, idx), segs);
+            while let Ok((fi, ch, idx, segs)) = rx.recv() {
+                aligned.insert((fi, ch, idx), segs);
             }
         }
-        for ((fi, _), segs) in aligned {
+        for ((fi, _, _), segs) in aligned {
             transcripts[fi].segments.extend(segs);
         }
+    } else if split_active {
+        // --- многоканальная сборка: каналы = спикеры + turns ---
+        for fi in 0..n_files {
+            // слова по каналам в порядке чанков
+            let mut ch_words: BTreeMap<usize, Vec<Word>> = BTreeMap::new();
+            for ((_f, ch, _), (_, _, segs)) in pending.range((fi, 0, 0)..(fi + 1, 0, 0)) {
+                for seg in segs {
+                    for w in &seg.words {
+                        ch_words.entry(*ch).or_default().push(w.clone());
+                    }
+                }
+            }
+            let channels: Vec<ChannelWords> = ch_words
+                .into_iter()
+                .map(|(ch, mut words)| {
+                    for w in &mut words {
+                        w.channel = Some(ch);
+                        w.speaker = Some(format!("SPEAKER_{ch:02}"));
+                    }
+                    ChannelWords { channel: ch, words }
+                })
+                .collect();
+            let turns = channels::build_turns(&channels, args.turn_gap);
+            let merged = channels::merge_words(&channels);
+            let mut segs: Vec<Segment> = Vec::new();
+            if !merged.is_empty() {
+                let start = merged[0].start;
+                let end = merged.last().unwrap().end;
+                let one = Segment {
+                    start,
+                    end,
+                    text: join_word_texts(&merged),
+                    words: merged,
+                    speaker: None,
+                    channel: None,
+                };
+                segs = rebuild_segments_by_speaker(vec![one]);
+                for s in &mut segs {
+                    s.channel = s.words.first().and_then(|w| w.channel);
+                }
+            }
+            transcripts[fi].segments = segs;
+            transcripts[fi].turns = turns;
+        }
+        // pending больше не нужен
+        pending.clear();
     } else {
-        for ((fi, _), (_, _, segs)) in pending {
+        for ((fi, _, _), (_, _, segs)) in pending {
             transcripts[fi].segments.extend(segs);
         }
     }
 
-    // --- attach speakers from diarization ---
+    // --- attach speakers from diarization (только mono-путь) ---
     let diar_slots: Vec<Option<anyhow::Result<diarize::Diarization>>> =
         std::mem::take(&mut *diar_results.lock().unwrap());
     for (file_idx, slot) in diar_slots.into_iter().enumerate() {
@@ -813,25 +854,30 @@ fn main() -> Result<()> {
             written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
         );
         if !args.quiet {
-            println!("--- {} ---\n{}", file.display(), t.text());
+            let text = if split_active && !t.turns.is_empty() {
+                dialog_text(&t.turns)
+            } else {
+                t.text()
+            };
+            println!("--- {} ---\n{}", file.display(), text);
         }
     }
     tracing::info!("всего чанков обработано: {received}");
     println!("{}", stats::report());
 
+    pool.close();
     Ok(())
 }
-
 
 /// Split segments at speaker changes and merge tiny runs, so subtitle cues
 /// align with who is speaking (segments can span 30 s chunks otherwise).
 fn rebuild_segments_by_speaker(segs: Vec<Segment>) -> Vec<Segment> {
-    fn make_seg(words: Vec<Word>, speaker: Option<String>) -> Segment {
+    fn make_seg(words: Vec<Word>, speaker: Option<String>, channel: Option<usize>) -> Segment {
         let start = words[0].start;
         let end = words.last().unwrap().end;
         // words from some backends carry no spacing — rebuild with spacing rules
         let text = join_word_texts(&words);
-        Segment { start, end, text, words, speaker }
+        Segment { start, end, text, words, speaker, channel }
     }
 
     // 1. split into per-speaker runs
@@ -845,7 +891,9 @@ fn rebuild_segments_by_speaker(segs: Vec<Segment>) -> Vec<Segment> {
         let mut cur_spk: Option<String> = None;
         for w in seg.words {
             if cur_spk.is_some() && w.speaker.is_some() && w.speaker != cur_spk {
-                runs.push(make_seg(std::mem::take(&mut cur), cur_spk.take()));
+                let spk = cur_spk.take();
+                let ch = cur.first().and_then(|x| x.channel);
+                runs.push(make_seg(std::mem::take(&mut cur), spk, ch));
             }
             if cur_spk.is_none() {
                 cur_spk = w.speaker.clone();
@@ -853,7 +901,9 @@ fn rebuild_segments_by_speaker(segs: Vec<Segment>) -> Vec<Segment> {
             cur.push(w);
         }
         if !cur.is_empty() {
-            runs.push(make_seg(cur, cur_spk));
+            let spk = cur_spk;
+            let ch = cur.first().and_then(|x| x.channel);
+            runs.push(make_seg(cur, spk, ch));
         }
     }
 
@@ -874,56 +924,4 @@ fn rebuild_segments_by_speaker(segs: Vec<Segment>) -> Vec<Segment> {
         out.push(r);
     }
     out
-}
-
-fn try_build_worker(
-    paths: &models::ModelPaths,
-    model: ModelKind,
-    use_cuda: bool,
-    intra: usize,
-    dtw: bool,
-) -> Result<Worker> {
-    match model {
-        ModelKind::WhisperTurbo => {
-            let w = whisper::WhisperTurbo::load(&paths.whisper_turbo, use_cuda, dtw)?;
-            let state = w.create_state()?;
-            Ok(Worker::Whisper(w, state))
-        }
-        ModelKind::GigaamV3 => {
-            let g = gigaam::GigaAmV3::load(&paths.gigaam_model, &paths.gigaam_vocab, use_cuda, intra)?;
-            Ok(Worker::Gigaam(g))
-        }
-        ModelKind::GigaamV3Rnnt => {
-            let g = gigaam_rnnt::GigaAmRnnt::load(&paths.gigaam_rnnt_dir, use_cuda, intra)?;
-            Ok(Worker::GigaamRnnt(g))
-        }
-        ModelKind::ParakeetV3 => {
-            let p = parakeet::ParakeetV3::load(&paths.parakeet_dir, use_cuda, intra)?;
-            Ok(Worker::Parakeet(p))
-        }
-    }
-}
-
-/// Auto worker count: CUDA — from free VRAM (NVML) and model size;
-/// CPU — a single worker that uses all cores via intra-op threads.
-fn auto_workers(use_cuda: bool, model: ModelKind) -> usize {
-    if !use_cuda {
-        return 1;
-    }
-    let free = nvml_wrapper::Nvml::init().ok().and_then(|nvml| {
-        let dev = nvml.device_by_index(0).ok()?;
-        let m = dev.memory_info().ok()?;
-        Some(m.free)
-    });
-    let per_model: f64 = match model {
-        ModelKind::WhisperTurbo => 2.2e9,
-        // 1.5e9, not 1.3e9: 4 GigaAM sessions OOM on a 6 GB card (measured on
-        // Linux with ~6.4 GB free); 3 is the documented optimum for 6 GB.
-        ModelKind::GigaamV3 | ModelKind::GigaamV3Rnnt => 1.5e9,
-        ModelKind::ParakeetV3 => 2.8e9,
-    };
-    match free {
-        Some(free) => (((free as f64 - 0.8e9) / per_model).floor() as usize).clamp(1, 4),
-        None => 2,
-    }
 }

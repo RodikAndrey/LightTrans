@@ -142,7 +142,7 @@ impl GigaAmRnnt {
         let text = words_to_text(&words);
         let start = words[0].start;
         let end = words.last().unwrap().end;
-        Ok(Some(Segment { start, end, text, words, speaker: None }))
+        Ok(Some(Segment { start, end, text, words, speaker: None, channel: None }))
     }
 
     /// Prediction network: last token + LSTM state -> 320-d embedding + new state.

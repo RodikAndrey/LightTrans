@@ -195,6 +195,7 @@ impl ParakeetV3 {
                 end: offset + end,
                 score: Some(score(cur_scores)),
                 speaker: None,
+                channel: None,
             });
             *cur_first_t = None;
             *cur_body_start = None;
@@ -259,7 +260,7 @@ impl ParakeetV3 {
             .to_string();
         let start = words[0].start;
         let end = words.last().unwrap().end;
-        Ok(Some(Segment { start, end, text, words, speaker: None }))
+        Ok(Some(Segment { start, end, text, words, speaker: None, channel: None }))
     }
 }
 

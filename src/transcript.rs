@@ -7,9 +7,13 @@ pub struct Word {
     pub end: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f32>,
-    /// Speaker label (e.g. "SPEAKER_00") when diarization is enabled.
+    /// Speaker label (e.g. "SPEAKER_00") when diarization is enabled, or the
+    /// channel-derived label (`SPEAKER_0N`) in split-channels mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker: Option<String>,
+    /// Исходный номер канала входа (только в режиме разделения каналов).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -19,15 +23,37 @@ pub struct Segment {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<Word>,
-    /// Majority speaker of the segment's words when diarization is enabled.
+    /// Majority speaker of the segment's words when diarization is enabled
+    /// or channels are split into speakers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker: Option<String>,
+    /// Исходный номер канала сегмента (в режиме разделения каналов).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<usize>,
+}
+
+/// Реплика диалога одного канала (режим разделения каналов).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Turn {
+    pub channel: usize,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Transcript {
     pub language: String,
     pub segments: Vec<Segment>,
+    /// Реплики диалога (только в режиме разделения каналов с --turns).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<Turn>,
+}
+
+impl Default for Transcript {
+    fn default() -> Self {
+        Self { language: String::new(), segments: Vec::new(), turns: Vec::new() }
+    }
 }
 
 impl Transcript {

@@ -20,9 +20,13 @@ pub const START_PAD_S: f64 = 0.2;
 #[derive(Debug)]
 pub struct Chunk {
     pub file_idx: usize,
+    /// Канал исходного входа (в mono-режиме всегда 0).
+    pub channel: usize,
     pub idx: usize,
     pub start: f64,
     pub samples: Vec<f32>,
+    /// Метка для сводки stats.rs (файл либо файл#chN).
+    pub stats_label: String,
 }
 
 /// Streaming chunker: feed audio blocks + closed VAD intervals (absolute
@@ -30,6 +34,8 @@ pub struct Chunk {
 /// into fixed windows.
 pub struct Chunker {
     file_idx: usize,
+    channel: usize,
+    stats_label: String,
     chunk_samples: usize,
     t0: usize,     // absolute sample index of current chunk start
     buf: Vec<f32>, // samples since t0
@@ -41,9 +47,17 @@ pub struct Chunker {
 }
 
 impl Chunker {
-    pub fn new(file_idx: usize, chunk_size: f64, fixed: bool) -> Self {
+    pub fn new(
+        file_idx: usize,
+        channel: usize,
+        stats_label: String,
+        chunk_size: f64,
+        fixed: bool,
+    ) -> Self {
         Self {
             file_idx,
+            channel,
+            stats_label,
             chunk_samples: (chunk_size * SR) as usize,
             t0: 0,
             buf: Vec::new(),
@@ -77,12 +91,8 @@ impl Chunker {
         if self.fixed {
             self.emit_fixed(out);
             if !self.buf.is_empty() {
-                out.push(Chunk {
-                    file_idx: self.file_idx,
-                    idx: self.idx,
-                    start: self.t0 as f64 / SR,
-                    samples: std::mem::take(&mut self.buf),
-                });
+                let samples = std::mem::take(&mut self.buf);
+                self.push_chunk(out, samples);
                 self.idx += 1;
                 self.t0 = self.fed;
             }
@@ -100,12 +110,7 @@ impl Chunker {
                 .min(self.buf.len());
             if close > 0 {
                 let samples = self.buf[..close].to_vec();
-                out.push(Chunk {
-                    file_idx: self.file_idx,
-                    idx: self.idx,
-                    start: self.t0 as f64 / SR,
-                    samples,
-                });
+                self.push_chunk(out, samples);
                 self.idx += 1;
             }
             self.buf.clear();
@@ -118,9 +123,11 @@ impl Chunker {
                 let abs = self.fed - total + pos;
                 out.push(Chunk {
                     file_idx: self.file_idx,
+                    channel: self.channel,
                     idx: self.idx,
                     start: abs as f64 / SR,
                     samples: self.buf[pos..pos + take].to_vec(),
+                    stats_label: self.stats_label.clone(),
                 });
                 self.idx += 1;
                 pos += take;
@@ -132,12 +139,7 @@ impl Chunker {
     fn emit_fixed(&mut self, out: &mut Vec<Chunk>) {
         while self.buf.len() >= self.chunk_samples {
             let samples = self.buf[..self.chunk_samples].to_vec();
-            out.push(Chunk {
-                file_idx: self.file_idx,
-                idx: self.idx,
-                start: self.t0 as f64 / SR,
-                samples,
-            });
+            self.push_chunk(out, samples);
             self.idx += 1;
             self.buf.drain(..self.chunk_samples);
             self.t0 += self.chunk_samples;
@@ -169,12 +171,7 @@ impl Chunker {
                 let close = close_abs.min(self.fed).saturating_sub(self.t0).min(self.buf.len());
                 if close > 0 {
                     let samples = self.buf[..close].to_vec();
-                    out.push(Chunk {
-                        file_idx: self.file_idx,
-                        idx: self.idx,
-                        start: self.t0 as f64 / SR,
-                        samples,
-                    });
+                    self.push_chunk(out, samples);
                     self.idx += 1;
                     self.buf.drain(..close);
                     self.t0 += close;
@@ -186,15 +183,21 @@ impl Chunker {
         // hard split of long continuous speech (no interval boundaries)
         while self.buf.len() > self.chunk_samples + 8 * SR as usize {
             let samples = self.buf[..self.chunk_samples].to_vec();
-            out.push(Chunk {
-                file_idx: self.file_idx,
-                idx: self.idx,
-                start: self.t0 as f64 / SR,
-                samples,
-            });
+            self.push_chunk(out, samples);
             self.idx += 1;
             self.buf.drain(..self.chunk_samples);
             self.t0 += self.chunk_samples;
         }
+    }
+
+    fn push_chunk(&self, out: &mut Vec<Chunk>, samples: Vec<f32>) {
+        out.push(Chunk {
+            file_idx: self.file_idx,
+            channel: self.channel,
+            idx: self.idx,
+            start: self.t0 as f64 / SR,
+            samples,
+            stats_label: self.stats_label.clone(),
+        });
     }
 }

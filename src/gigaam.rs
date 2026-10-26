@@ -163,6 +163,7 @@ impl GigaAmV3 {
             text,
             words,
             speaker: None,
+            channel: None,
         }))
     }
 }
@@ -197,6 +198,7 @@ pub(crate) fn build_words(
                 end: offset + (ce + 1) as f64 * shift,
                 score: Some((score * 1000.0).round() / 1000.0),
                 speaker: None,
+                channel: None,
             });
         }
         cur.clear();

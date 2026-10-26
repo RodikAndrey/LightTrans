@@ -181,6 +181,7 @@ impl WhisperTurbo {
                                 end: offset + end as f64 / 100.0,
                                 score: Some(score(&probs)),
                                 speaker: None,
+                                channel: None,
                             });
                             prev_end_cs = end;
                         } else {
@@ -210,6 +211,7 @@ impl WhisperTurbo {
                         end: offset + end as f64 / 100.0,
                         score: Some(score(&probs)),
                         speaker: None,
+                        channel: None,
                     });
                     prev_end_cs = end;
                 }
@@ -223,6 +225,7 @@ impl WhisperTurbo {
                         end: (row.t1.max(row.t0 + 1)) as f64 / 100.0 + offset,
                         score: Some(row.p),
                         speaker: None,
+                        channel: None,
                     });
                 }
             }
@@ -236,7 +239,7 @@ impl WhisperTurbo {
         let out = segs
             .into_iter()
             .filter(|s| !s.text.is_empty())
-            .map(|s| Segment { start: s.start, end: s.end, text: s.text, words: s.words, speaker: None })
+            .map(|s| Segment { start: s.start, end: s.end, text: s.text, words: s.words, speaker: None, channel: None })
             .collect();
         Ok((out, lang))
     }

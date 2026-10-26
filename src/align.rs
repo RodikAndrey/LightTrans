@@ -139,6 +139,7 @@ impl WordAligner {
             seg: usize,
             text: String,
             speaker: Option<String>,
+            channel: Option<usize>,
         }
         let mut all_words: Vec<WRef> = Vec::new();
         for (si, seg) in segs.iter().enumerate() {
@@ -147,6 +148,7 @@ impl WordAligner {
                     seg: si,
                     text: w.to_string(),
                     speaker: seg.words.first().and_then(|w| w.speaker.clone()),
+                    channel: seg.channel,
                 });
             }
         }
@@ -356,6 +358,7 @@ impl WordAligner {
                     end,
                     score,
                     speaker: w.speaker.clone(),
+                    channel: w.channel,
                 });
             }
             if words.is_empty() {
