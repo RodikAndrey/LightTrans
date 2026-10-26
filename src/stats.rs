@@ -179,6 +179,62 @@ fn format_rate(x: f64) -> String {
     }
 }
 
+fn round3(x: f64) -> f64 {
+    (x * 1000.0).round() / 1000.0
+}
+
+/// Машиночитаемая сводка (CLI `bench`, Фаза 5 PORTING.md): стабильная схема
+/// json, времена в секундах, округлены до миллисекунд. Этапы — те же
+/// окна-накопители, что и в человекочитаемой таблице (`report`).
+pub fn report_json() -> String {
+    let total = now();
+    let (spans, accum, audio) = with(|s| (s.spans.clone(), s.accum.clone(), s.audio.clone()))
+        .unwrap_or_default();
+
+    let mut rows: Vec<(f64, serde_json::Value)> = Vec::new();
+    for sp in &spans {
+        rows.push((
+            sp.start,
+            serde_json::json!({
+                "stage": sp.name,
+                "file": sp.file,
+                "start_sec": round3(sp.start),
+                "sec": round3(sp.dur),
+            }),
+        ));
+    }
+    for ac in &accum {
+        rows.push((
+            ac.first.unwrap_or(ac.last),
+            serde_json::json!({
+                "stage": ac.name,
+                "file": ac.file,
+                "start_sec": round3(ac.first.unwrap_or(ac.last)),
+                "sec": round3(ac.total),
+                "count": ac.count,
+            }),
+        ));
+    }
+    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let audio_total: f64 = audio.values().sum();
+    let doc = serde_json::json!({
+        "wall_sec": round3(total),
+        "audio_sec": round3(audio_total),
+        "rtf": if audio_total > 0.0 {
+            serde_json::json!(round3(total / audio_total))
+        } else {
+            serde_json::Value::Null
+        },
+        "files": audio
+            .iter()
+            .map(|(f, s)| serde_json::json!({ "file": f, "audio_sec": round3(*s) }))
+            .collect::<Vec<_>>(),
+        "stages": rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+    });
+    doc.to_string()
+}
+
 /// Shorten a path for the table: keep the file name only.
 fn file_short(file: &str) -> String {
     let name = file.rsplit(['\\', '/']).next().unwrap_or(file);

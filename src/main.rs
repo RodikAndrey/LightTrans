@@ -17,7 +17,7 @@ use lighttrans::pipeline::{
 use lighttrans::segments::Chunk;
 use lighttrans::transcript::{join_word_texts, Segment, Transcript, Word};
 use lighttrans::worker::{auto_workers, try_build_worker, ModelKind, Worker};
-use lighttrans::{align, audio, channels, df, diarize, models, output, pipeline, stats, transcript};
+use lighttrans::{align, audio, channels, df, diarize, models, output, pipeline, stats, transcript, vad};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -35,9 +35,23 @@ use std::time::Instant;
   lighttrans video.mp4                        gigaam-v3, русский
   lighttrans talk.mkv -m whisper-turbo -l ru --w2v   пословные таймстампы
   lighttrans rec.mp3 --diarize --denoise      спикеры + шумоподавление
-  lighttrans conf.wav --split-channels --turns  каждый канал — спикер, диалог"
+  lighttrans conf.wav --split-channels --turns  каждый канал — спикер, диалог
+  lighttrans vad meeting.mp4 -o intervals.json   интервалы речи (Silero), без распознавания
+  lighttrans bench video.mp4 -m gigaam-v3        этапы и RTF, машиночитаемый json"
 )]
 struct Args {
+    /// vad — интервалы речи Silero (json); bench — бенчмарк этапов и RTF;
+    /// без подкоманды — транскрибация
+    #[command(subcommand)]
+    command: Option<Cmd>,
+
+    #[command(flatten)]
+    tr: TranscribeArgs,
+}
+
+/// Флаги транскрибации: тело запуска без подкоманды и тело `bench`.
+#[derive(clap::Args, Clone)]
+struct TranscribeArgs {
     /// Входные аудио/видео файлы
     files: Vec<PathBuf>,
 
@@ -136,6 +150,37 @@ struct Args {
     /// показать справку и выйти
     #[arg(short = 'h', long)]
     help: bool,
+}
+
+#[derive(clap::Subcommand)]
+enum Cmd {
+    /// интервалы речи Silero VAD без распознавания, json на выход
+    Vad {
+        /// Входные аудио/видео файлы
+        files: Vec<PathBuf>,
+
+        /// выход: файл (при одном входе) или каталог; по умолчанию <вход>.vad.json
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// порог начала речи
+        #[arg(long, default_value_t = 0.5)]
+        vad_onset: f32,
+
+        /// порог окончания речи
+        #[arg(long, default_value_t = 0.363)]
+        vad_offset: f32,
+
+        /// каталог с моделями
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
+    },
+    /// прогон транскрибации с машиночитаемой сводкой этапов и RTF
+    /// (json в stdout, таблица — в stderr, текст не печатается)
+    Bench {
+        #[command(flatten)]
+        tr: TranscribeArgs,
+    },
 }
 
 /// Печатает текст постранично, если терминал ниже текста: страница помещается
@@ -273,15 +318,101 @@ fn main() -> Result<()> {
     }
 
     stats::init();
-    tracing_subscriber::fmt()
+    let cli = Args::parse();
+    // bench печатает в stdout машиночитаемый json — все логи уходят в stderr
+    let bench = matches!(cli.command, Some(Cmd::Bench { .. }));
+    init_tracing(bench);
+
+    match cli.command {
+        Some(Cmd::Vad { files, output, vad_onset, vad_offset, models_dir }) => {
+            return run_vad(&files, output.as_deref(), vad_onset, vad_offset, models_dir.as_deref());
+        }
+        Some(Cmd::Bench { tr }) => {
+            // bench — это транскрибация без печати текста и с json-сводкой
+            let mut tr = tr;
+            tr.quiet = true;
+            return run_transcribe(tr, true);
+        }
+        None => {}
+    }
+    run_transcribe(cli.tr, false)
+}
+
+/// Инициализация tracing: `stderr = true` — все логи в stderr (bench держит
+/// stdout чистым под json).
+fn init_tracing(stderr: bool) {
+    let sub = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,ort=warn,onnxruntime=warn".into()),
         )
-        .with_target(false)
-        .init();
+        .with_target(false);
+    if stderr {
+        sub.with_writer(std::io::stderr).init();
+    } else {
+        sub.with_writer(std::io::stdout).init();
+    }
+}
 
-    let args = Args::parse();
+/// Подкоманда `vad` (Фаза 5 PORTING.md): декод → Silero VAD → интервалы речи
+/// в json. Распознавание не запускается, ASR-модели не загружаются.
+fn run_vad(
+    files: &[PathBuf],
+    output: Option<&std::path::Path>,
+    vad_onset: f32,
+    vad_offset: f32,
+    models_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    if files.is_empty() {
+        anyhow::bail!("укажите хотя бы один входной файл");
+    }
+    let paths = models::resolve(models_dir)?;
+    let many = files.len() > 1;
+    for file in files {
+        let out_path = match output {
+            Some(p) if many => p.join(format!(
+                "{}.vad.json",
+                file.file_stem().and_then(|s| s.to_str()).unwrap_or("audio")
+            )),
+            Some(p) => p.to_path_buf(),
+            None => file.with_extension("vad.json"),
+        };
+        let file_disp = file.display().to_string();
+        let mut vad = pipeline::ChunkSource::load_vad(&paths.silero_vad, vad_onset, vad_offset)?;
+        let mut intervals: Vec<vad::VadSegment> = Vec::new();
+        let duration = audio::decode_streaming(file, audio::TARGET_SR, 16_000, |block| {
+            vad.feed(block, &mut intervals)
+        })
+        .with_context(|| format!("декодирование {file_disp}"))?;
+        vad.finish(&mut intervals);
+        let doc = serde_json::json!({
+            "file": file_disp,
+            "duration_sec": (duration * 1000.0).round() / 1000.0,
+            "sample_rate": audio::TARGET_SR,
+            "vad": { "onset": round4(vad_onset), "offset": round4(vad_offset) },
+            "intervals": intervals
+                .iter()
+                .map(|i| serde_json::json!({
+                    "start": (i.start * 1000.0).round() / 1000.0,
+                    "end": (i.end * 1000.0).round() / 1000.0,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        std::fs::write(&out_path, serde_json::to_string_pretty(&doc)? + "\n")
+            .with_context(|| format!("запись {}", out_path.display()))?;
+        println!("saved: {} ({} интервалов)", out_path.display(), intervals.len());
+    }
+    Ok(())
+}
+
+fn round4(x: f32) -> f64 {
+    (f64::from(x) * 10_000.0).round() / 10_000.0
+}
+
+/// Весь конвейер транскрибации (общее тело запуска без подкоманды и `bench`).
+/// В bench-режиме текст не печатается (quiet уже выставлен), человекочитаемая
+/// сводка уходит в stderr, а в stdout — стабильный json этапов и RTF.
+fn run_transcribe(mut args: TranscribeArgs, bench: bool) -> Result<()> {
     if args.files.is_empty() {
         anyhow::bail!("укажите хотя бы один входной файл");
     }
@@ -852,10 +983,12 @@ fn main() -> Result<()> {
                 .unwrap_or_default(),
         );
         let written = output::write_outputs(t, &stem, &formats)?;
-        println!(
-            "saved: {}",
-            written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
-        );
+        let saved = written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+        if bench {
+            eprintln!("saved: {saved}");
+        } else {
+            println!("saved: {saved}");
+        }
         if !args.quiet {
             let text = if split_active && !t.turns.is_empty() {
                 dialog_text(&t.turns)
@@ -866,7 +999,12 @@ fn main() -> Result<()> {
         }
     }
     tracing::info!("всего чанков обработано: {received}");
-    println!("{}", stats::report());
+    if bench {
+        eprint!("{}", stats::report());
+        println!("{}", stats::report_json());
+    } else {
+        println!("{}", stats::report());
+    }
 
     pool.close();
     Ok(())
