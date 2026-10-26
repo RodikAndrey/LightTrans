@@ -12,7 +12,9 @@ axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 ffmpeg-next = "9.0.0"
 nvml-wrapper = "0.10"
-ort = { version = "=2.0.0-rc.13", features = ["cuda", "half"] }
+# api-24: инспекция назначения узлов EP (Session_GetEpGraphAssignmentInfo,
+# Фаза 4 PORTING.md) — доступна в рантайме ORT 1.29 из ort-sys
+ort = { version = "=2.0.0-rc.13", features = ["cuda", "half", "api-24"] }
 half = "2"
 realfft = "3"
 # DeepFilterNet 3 (libDF): шумоподавление, модель DFN3 вшита через feature default-model

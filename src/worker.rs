@@ -1,6 +1,7 @@
 //! Воркеры инференса: один воркер = одна загруженная модель бэкенда.
 //! Код перенесён из `main.rs`, чтобы CLI и сервер использовали общий пул.
 
+use crate::ort_assignment::Policy;
 use crate::{gigaam, gigaam_rnnt, models, parakeet, whisper};
 use anyhow::Result;
 use clap::ValueEnum;
@@ -90,12 +91,16 @@ impl Worker {
     }
 }
 
+/// `policy` — политика верификации CUDA-назначений (Фаза 4): сервер передаёт
+/// разобранную политику, CLI — `None` (поведение CLI не меняется). Схема
+/// покрывает роли CTC/RNNT; parakeet и whisper вне неё.
 pub fn try_build_worker(
     paths: &models::ModelPaths,
     model: ModelKind,
     use_cuda: bool,
     intra: usize,
     dtw: bool,
+    policy: Option<&Policy>,
 ) -> Result<Worker> {
     match model {
         ModelKind::WhisperTurbo => {
@@ -104,11 +109,17 @@ pub fn try_build_worker(
             Ok(Worker::Whisper(w, state))
         }
         ModelKind::GigaamV3 => {
-            let g = gigaam::GigaAmV3::load(&paths.gigaam_model, &paths.gigaam_vocab, use_cuda, intra)?;
+            let g = gigaam::GigaAmV3::load(
+                &paths.gigaam_model,
+                &paths.gigaam_vocab,
+                use_cuda,
+                intra,
+                policy,
+            )?;
             Ok(Worker::Gigaam(g))
         }
         ModelKind::GigaamV3Rnnt => {
-            let g = gigaam_rnnt::GigaAmRnnt::load(&paths.gigaam_rnnt_dir, use_cuda, intra)?;
+            let g = gigaam_rnnt::GigaAmRnnt::load(&paths.gigaam_rnnt_dir, use_cuda, intra, policy)?;
             Ok(Worker::GigaamRnnt(g))
         }
         ModelKind::ParakeetV3 => {

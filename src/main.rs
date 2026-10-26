@@ -329,7 +329,9 @@ fn main() -> Result<()> {
             .map(|_| {
                 let paths = paths.clone();
                 let model = args.model;
-                std::thread::spawn(move || try_build_worker(&paths, model, use_cuda, intra, args.dtw))
+                std::thread::spawn(move || {
+                    try_build_worker(&paths, model, use_cuda, intra, args.dtw, None)
+                })
             })
             .collect()
     };

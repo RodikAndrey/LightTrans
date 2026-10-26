@@ -15,6 +15,7 @@ pub mod manifest;
 pub mod mel;
 pub mod metrics;
 pub mod models;
+pub mod ort_assignment;
 pub mod output;
 pub mod parakeet;
 pub mod pipeline;

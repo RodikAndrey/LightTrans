@@ -10,6 +10,7 @@
 
 use crate::gigaam::{build_words, load_vocab};
 use crate::mel::MelExtractor;
+use crate::ort_assignment::{self, Policy, Role};
 use crate::transcript::{Segment, Word};
 use anyhow::{Context, Result};
 use ort::ep::{CUDA, ExecutionProviderDispatch};
@@ -32,36 +33,67 @@ pub struct GigaAmRnnt {
 }
 
 impl GigaAmRnnt {
-    pub fn load(model_dir: &Path, use_cuda: bool, intra_threads: usize) -> Result<Self> {
+    pub fn load(
+        model_dir: &Path,
+        use_cuda: bool,
+        intra_threads: usize,
+        policy: Option<&Policy>,
+    ) -> Result<Self> {
         let encoder = make_session(
             &model_dir.join("v3_e2e_rnnt_encoder.onnx"),
             use_cuda,
             intra_threads,
+            policy.is_some(),
         )?;
-        let decoder =
-            make_session(&model_dir.join("v3_e2e_rnnt_decoder.onnx"), false, intra_threads)?;
-        let joint =
-            make_session(&model_dir.join("v3_e2e_rnnt_joint.onnx"), false, intra_threads)?;
+        let decoder = make_session(
+            &model_dir.join("v3_e2e_rnnt_decoder.onnx"),
+            false,
+            intra_threads,
+            false,
+        )?;
+        let joint = make_session(
+            &model_dir.join("v3_e2e_rnnt_joint.onnx"),
+            false,
+            intra_threads,
+            false,
+        )?;
+
+        // Фаза 4: инспекция и верификация назначения графа — только энкодер
+        // (decoder/joint всегда CPU, вне схемы)
+        if let Some(policy) = policy {
+            if use_cuda {
+                let evidence =
+                    ort_assignment::inspect(&encoder).map_err(anyhow::Error::msg)?;
+                policy
+                    .check(Role::Rnnt, &evidence)
+                    .map_err(anyhow::Error::msg)?;
+                if policy.is_allow_unverified() {
+                    eprintln!(
+                        "# CUDA assignment unverified role=rnnt sha256={} cpu_nodes={} cuda_nodes={}",
+                        evidence.fingerprint().to_hex(),
+                        evidence.cpu_assignments(),
+                        evidence.cuda_assignments()
+                    );
+                }
+            }
+        }
 
         let vocab_path = model_dir.join("v3_e2e_rnnt_vocab.txt");
         let (vocab, blank_id) = load_vocab(&vocab_path)
             .with_context(|| format!("load vocab: {}", vocab_path.display()))?;
 
-        // Фаза 3: сверка IO-имён с манифестом (источник ловил здесь рассинхрон
-        // вида «decoder inputs должны быть x,h.1,c.1, а не x,hi,ci»)
+        // Фаза 3: сверка IO-имён с манифестом. io в манифесте — объединённая
+        // поверхность семейства (encoder+decoder+joint), поэтому сверяем её
+        // одним вызовом по сумме IO всех трёх графов (источник ловил здесь
+        // рассинхрон вида «decoder inputs должны быть x,h.1,c.1, а не x,hi,ci»)
         if let Some(m) = crate::manifest::load_for(model_dir) {
-            let io = |s: &Session| -> (Vec<String>, Vec<String>) {
-                (
-                    s.inputs().iter().map(|i| i.name().to_string()).collect(),
-                    s.outputs().iter().map(|o| o.name().to_string()).collect(),
-                )
-            };
-            let (i, o) = io(&encoder);
-            m.verify_io("gigaam-v3 RNN-T encoder", &i, &o)?;
-            let (i, o) = io(&decoder);
-            m.verify_io("gigaam-v3 RNN-T decoder", &i, &o)?;
-            let (i, o) = io(&joint);
-            m.verify_io("gigaam-v3 RNN-T joint", &i, &o)?;
+            let mut ins: Vec<String> = Vec::new();
+            let mut outs: Vec<String> = Vec::new();
+            for s in [&encoder, &decoder, &joint] {
+                ins.extend(s.inputs().iter().map(|i| i.name().to_string()));
+                outs.extend(s.outputs().iter().map(|o| o.name().to_string()));
+            }
+            m.verify_io("gigaam-v3 RNN-T (encoder+decoder+joint)", &ins, &outs)?;
         }
 
         Ok(Self { encoder, decoder, joint, vocab, blank_id, mel: MelExtractor::new() })
@@ -217,15 +249,31 @@ fn prob_at(logits: &[f32], idx: usize) -> f32 {
     ((logits[idx] - max).exp() / sum).max(0.0)
 }
 
-fn make_session(model: &Path, use_cuda: bool, intra: usize) -> Result<Session> {
-    let eps: Vec<ExecutionProviderDispatch> =
-        if use_cuda { vec![CUDA::default().build()] } else { vec![] };
-    Session::builder()
+fn make_session(
+    model: &Path,
+    use_cuda: bool,
+    intra: usize,
+    record_assignment: bool,
+) -> Result<Session> {
+    let eps: Vec<ExecutionProviderDispatch> = if use_cuda {
+        // error_on_failure: отказ при недоступном CUDA вместо тихого fallback на CPU (Фаза 4)
+        vec![CUDA::default().build().error_on_failure()]
+    } else {
+        vec![]
+    };
+    let mut builder = Session::builder()
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .with_intra_threads(intra.max(1))
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if record_assignment && use_cuda {
+        // без записи назначений inspect() нечего читать (API-24, Фаза 4)
+        builder = builder
+            .with_config_entry("session.record_ep_graph_assignment_info", "1")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    builder
         .with_execution_providers(eps)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .commit_from_file(model)

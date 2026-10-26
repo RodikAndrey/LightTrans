@@ -5,9 +5,10 @@
 //! активные дожидаются завершения.
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use lighttrans::metrics::Metrics;
 use lighttrans::models;
+use lighttrans::ort_assignment::Policy;
 use lighttrans::pipeline::WorkerPool;
 use lighttrans::server::{self, AppState, ModelPools, ServerInner};
 use lighttrans::stats;
@@ -15,13 +16,25 @@ use lighttrans::worker::{self, ModelKind, Worker};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Провайдер исполнения ONNX-графов. Выбирается явно, fallback запрещён:
+/// недоступный CUDA — отказ старта, а не тихая работа на CPU (Фаза 4).
+/// tensorrt этой сборкой не поддерживается (ort без фичи tensorrt).
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Ep {
+    Cpu,
+    Cuda,
+}
+
 #[derive(Parser)]
 #[command(
     name = "lighttrans-server",
     version,
     about = "HTTP-сервис транскрибации: POST /v1/transcribe (GigaAM v3 CTC/RNN-T)",
     after_help = "Лимиты окружением (неверное значение отказывает, не подменяется):\n\
-                  ASR_MAX_CONCURRENCY=8 ASR_BODY_LIMIT_MB=64 ASR_REQ_TIMEOUT_SEC=120"
+                  ASR_MAX_CONCURRENCY=8 ASR_BODY_LIMIT_MB=64 ASR_REQ_TIMEOUT_SEC=120\n\
+                  Верификация CUDA-назначений (Фаза 4; только с --ep cuda):\n\
+                  ASR_CUDA_ASSIGNMENT_POLICY=verified|allow-unverified\n\
+                  ASR_CUDA_CTC_ASSIGNMENT_SHA256 ASR_CUDA_RNNT_ASSIGNMENT_SHA256"
 )]
 struct Args {
     /// порт HTTP-слушателя
@@ -32,9 +45,9 @@ struct Args {
     #[arg(long)]
     models_dir: Option<std::path::PathBuf>,
 
-    /// cuda | cpu
-    #[arg(long, default_value = "cuda")]
-    device: String,
+    /// провайдер исполнения: cpu | cuda (без fallback)
+    #[arg(long, value_enum, default_value_t = Ep::Cuda)]
+    ep: Ep,
 
     /// не загружать RNN-T (только CTC)
     #[arg(long)]
@@ -60,12 +73,12 @@ fn main() -> Result<()> {
     // кривое значение env отказывает, а не подменяется дефолтом
     let limits = server::config::ServerLimits::from_env()
         .map_err(|e| anyhow::anyhow!("конфигурация окружения: {e}"))?;
-
-    let use_cuda_requested = match args.device.as_str() {
-        "cuda" | "gpu" => true,
-        "cpu" => false,
-        other => anyhow::bail!("неизвестное устройство: {other} (cuda|cpu)"),
-    };
+    let use_cuda = args.ep == Ep::Cuda;
+    // политика верификации CUDA-назначений — тоже до загрузки моделей;
+    // Arc: политики живут в потоках-воркерах ('static)
+    let policy: Option<Arc<Policy>> = Policy::from_env(use_cuda, !args.no_rnnt)
+        .map_err(|e| anyhow::anyhow!("конфигурация окружения: {e}"))?
+        .map(Arc::new);
     let paths = models::resolve(args.models_dir.as_deref())?;
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -82,8 +95,9 @@ fn main() -> Result<()> {
         let mut handles = Vec::new();
         for _ in 0..count {
             let paths = paths.clone();
+            let policy = policy.clone();
             handles.push(std::thread::spawn(move || {
-                worker::try_build_worker(&paths, kind, use_cuda, intra, false)
+                worker::try_build_worker(&paths, kind, use_cuda, intra, false, policy.as_deref())
             }));
         }
         let mut out = Vec::new();
@@ -112,35 +126,26 @@ fn main() -> Result<()> {
 
     let metrics = Metrics::new_arc();
     metrics.set_max_transcribe(limits.max_concurrency);
+    // Выбор провайдера явный и окончательный: при ошибке — отказ (Фаза 4),
+    // fallback на CPU убран сознательно.
     let build_pool = |kind: ModelKind, use_cuda: bool| -> Result<WorkerPool> {
-        let mk_opts = |use_cuda: bool| lighttrans::pipeline::WorkerOpts {
+        let opts = lighttrans::pipeline::WorkerOpts {
             language: "ru".into(),
             translate: false,
             beam_size: 1,
             n_threads: if use_cuda { 4 } else { cores },
             metrics: Some(Arc::clone(&metrics)),
         };
-        match load_model(kind, use_cuda) {
-            Ok(workers) => {
-                tracing::info!(
-                    "{}: {} воркеров ({})",
-                    kind.id(),
-                    workers.len(),
-                    if use_cuda { "CUDA" } else { "CPU" }
-                );
-                Ok(WorkerPool::start(workers, mk_opts(use_cuda)))
-            }
-            Err(e) if use_cuda => {
-                tracing::warn!("{}: CUDA недоступна ({e:#}); переключаю на CPU", kind.id());
-                let workers = load_model(kind, false)?;
-                tracing::info!("{}: {} воркеров (CPU)", kind.id(), workers.len());
-                Ok(WorkerPool::start(workers, mk_opts(false)))
-            }
-            Err(e) => Err(e),
-        }
+        let workers = load_model(kind, use_cuda)?;
+        tracing::info!(
+            "{}: {} воркеров ({})",
+            kind.id(),
+            workers.len(),
+            if use_cuda { "CUDA" } else { "CPU" }
+        );
+        Ok(WorkerPool::start(workers, opts))
     };
 
-    let use_cuda = use_cuda_requested;
     let ctc = Arc::new(build_pool(ModelKind::GigaamV3, use_cuda)?);
     let rnnt = if args.no_rnnt {
         None

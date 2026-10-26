@@ -4,6 +4,7 @@
 //! (ONNX) -> CTC greedy decode -> words with frame-level timestamps.
 
 use crate::mel::MelExtractor;
+use crate::ort_assignment::{self, Policy, Role};
 use crate::transcript::{Segment, Word};
 use anyhow::{Context, Result};
 use ort::ep::{CUDA, ExecutionProviderDispatch};
@@ -22,23 +23,54 @@ pub struct GigaAmV3 {
 }
 
 impl GigaAmV3 {
-    pub fn load(model: &Path, vocab_path: &Path, use_cuda: bool, intra_threads: usize) -> Result<Self> {
+    pub fn load(
+        model: &Path,
+        vocab_path: &Path,
+        use_cuda: bool,
+        intra_threads: usize,
+        policy: Option<&Policy>,
+    ) -> Result<Self> {
         let eps: Vec<ExecutionProviderDispatch> = if use_cuda {
-            vec![CUDA::default().build()]
+            // error_on_failure: отказ при недоступном CUDA вместо тихого fallback на CPU (Фаза 4)
+            vec![CUDA::default().build().error_on_failure()]
         } else {
             vec![]
         };
 
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_intra_threads(intra_threads.max(1))
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if policy.is_some() && use_cuda {
+            // без записи назначений inspect() нечего читать (API-24, Фаза 4)
+            builder = builder
+                .with_config_entry("session.record_ep_graph_assignment_info", "1")
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        let session = builder
             .with_execution_providers(eps)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .commit_from_file(model)
             .with_context(|| format!("load gigaam model: {}", model.display()))?;
+
+        if let Some(policy) = policy {
+            if use_cuda {
+                let evidence = ort_assignment::inspect(&session).map_err(anyhow::Error::msg)?;
+                policy
+                    .check(Role::Ctc, &evidence)
+                    .map_err(anyhow::Error::msg)?;
+                if policy.is_allow_unverified() {
+                    eprintln!(
+                        "# CUDA assignment unverified role=ctc sha256={} cpu_nodes={} cuda_nodes={}",
+                        evidence.fingerprint().to_hex(),
+                        evidence.cpu_assignments(),
+                        evidence.cuda_assignments()
+                    );
+                }
+            }
+        }
 
         let (vocab, blank_id) = load_vocab(vocab_path)
             .with_context(|| format!("load vocab: {}", vocab_path.display()))?;
