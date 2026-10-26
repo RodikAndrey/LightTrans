@@ -1,0 +1,20 @@
+{
+  "files": [
+    {
+      "path": "silero_vad.onnx",
+      "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+      "size": 2327524
+    }
+  ],
+  "io": {
+    "inputs": [
+      "input",
+      "sr",
+      "state"
+    ],
+    "outputs": [
+      "output",
+      "stateN"
+    ]
+  }
+}

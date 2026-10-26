@@ -11,6 +11,7 @@ pub mod df;
 pub mod diarize;
 pub mod gigaam;
 pub mod gigaam_rnnt;
+pub mod manifest;
 pub mod mel;
 pub mod metrics;
 pub mod models;

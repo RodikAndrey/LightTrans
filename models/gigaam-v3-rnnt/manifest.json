@@ -1,0 +1,48 @@
+{
+  "files": [
+    {
+      "path": "v3_e2e_rnnt.yaml",
+      "sha256": "d23270a1f327e365ebc4554b7ceee69ac12898e21092c18085151516aa58f91b",
+      "size": 1041
+    },
+    {
+      "path": "v3_e2e_rnnt_decoder.onnx",
+      "sha256": "7b0a16d67fd2cb37061decc93c69e364a9ab27afee3c57495d55b1c974cf7231",
+      "size": 4599910
+    },
+    {
+      "path": "v3_e2e_rnnt_encoder.onnx",
+      "sha256": "cd60b3764a832e8560ae6d3ad0b10adc1a42ffae412b9476f25620aae4f4a508",
+      "size": 885084534
+    },
+    {
+      "path": "v3_e2e_rnnt_joint.onnx",
+      "sha256": "602ff7017a93311aad34df1437c8d7f49911353c13d6eae7a6ee7b041339465c",
+      "size": 2712896
+    },
+    {
+      "path": "v3_e2e_rnnt_vocab.txt",
+      "sha256": "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7",
+      "size": 13354
+    }
+  ],
+  "io": {
+    "inputs": [
+      "audio_signal",
+      "c.1",
+      "dec",
+      "enc",
+      "h.1",
+      "length",
+      "x"
+    ],
+    "outputs": [
+      "c",
+      "dec",
+      "encoded",
+      "encoded_len",
+      "h",
+      "joint"
+    ]
+  }
+}

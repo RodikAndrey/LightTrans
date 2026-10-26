@@ -47,6 +47,23 @@ impl GigaAmRnnt {
         let (vocab, blank_id) = load_vocab(&vocab_path)
             .with_context(|| format!("load vocab: {}", vocab_path.display()))?;
 
+        // Фаза 3: сверка IO-имён с манифестом (источник ловил здесь рассинхрон
+        // вида «decoder inputs должны быть x,h.1,c.1, а не x,hi,ci»)
+        if let Some(m) = crate::manifest::load_for(model_dir) {
+            let io = |s: &Session| -> (Vec<String>, Vec<String>) {
+                (
+                    s.inputs().iter().map(|i| i.name().to_string()).collect(),
+                    s.outputs().iter().map(|o| o.name().to_string()).collect(),
+                )
+            };
+            let (i, o) = io(&encoder);
+            m.verify_io("gigaam-v3 RNN-T encoder", &i, &o)?;
+            let (i, o) = io(&decoder);
+            m.verify_io("gigaam-v3 RNN-T decoder", &i, &o)?;
+            let (i, o) = io(&joint);
+            m.verify_io("gigaam-v3 RNN-T joint", &i, &o)?;
+        }
+
         Ok(Self { encoder, decoder, joint, vocab, blank_id, mel: MelExtractor::new() })
     }
 

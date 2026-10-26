@@ -46,6 +46,16 @@ impl SileroVad {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .commit_from_file(model_path)
             .with_context(|| format!("load silero vad: {}", model_path.display()))?;
+        // Фаза 3: сверка IO-имён с манифестом (если он есть рядом с моделью)
+        if let Some(m) =
+            crate::manifest::load_for(model_path.parent().unwrap_or(std::path::Path::new(".")))
+        {
+            let inputs: Vec<String> = session.inputs().iter().map(|i| i.name().to_string()).collect();
+            let outputs: Vec<String> =
+                session.outputs().iter().map(|o| o.name().to_string()).collect();
+            m.verify_io("silero-vad", &inputs, &outputs)?;
+        }
+
         Ok(Self {
             session,
             state: vec![0f32; 2 * BATCH * 128],

@@ -53,6 +53,11 @@ impl GigaAmV3 {
             .iter()
             .map(|o| o.name().to_string())
             .collect();
+        // Фаза 3: сверка IO-имён ONNX-графа с манифестом (если он есть)
+        if let Some(m) = crate::manifest::load_for(model.parent().unwrap_or(Path::new("."))) {
+            m.verify_io("gigaam-v3 CTC", &input_names, &output_names)?;
+        }
+
         // log_probs output: [1, T/4, num_classes]; optionally a second output
         // carries encoded_lengths (absent in some exports — then use shape[1])
         let (logprobs_out, lengths_out) = match output_names.iter().position(|n| n.contains("log")) {

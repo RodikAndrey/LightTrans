@@ -1,0 +1,28 @@
+{
+  "files": [
+    {
+      "path": "v3_e2e_ctc.onnx",
+      "sha256": "377701bd33568f4733feec2db5b2dc12544fd09a5a5dfa69ccf55d161f84027a",
+      "size": 885950079
+    },
+    {
+      "path": "v3_e2e_ctc.yaml",
+      "sha256": "e67eca3a311ad7c8813d36dff6b8eeba7ad3459fd811d6faea2a26535754a358",
+      "size": 899
+    },
+    {
+      "path": "v3_e2e_ctc_vocab.txt",
+      "sha256": "142de7570b3de5b3035ce111a89c228e80e6085273731d944093ddf24fa539cd",
+      "size": 2007
+    }
+  ],
+  "io": {
+    "inputs": [
+      "feature_lengths",
+      "features"
+    ],
+    "outputs": [
+      "log_probs"
+    ]
+  }
+}

@@ -53,6 +53,20 @@ pub fn resolve(explicit: Option<&Path>) -> anyhow::Result<ModelPaths> {
             )
         })?;
 
+    // Фаза 3: манифесты моделей (если есть) проверяются до любой загрузки —
+    // битые/подменённые файлы отсекаются с именем файла и расхождением
+    let family_dirs = [
+        base.clone(),
+        base.join(GIGAAM_DIR),
+        base.join(GIGAAM_RNNT_DIR),
+        base.join("nemotron3-diarization"),
+        base.join("parakeet-v3"),
+        base.join("wav2vec2-align-ru"),
+    ];
+    for dir in &family_dirs {
+        crate::manifest::verify_dir(dir)?;
+    }
+
     let gigaam_dir = base.join(GIGAAM_DIR);
     Ok(ModelPaths {
         whisper_turbo: base.join(WHISPER_TURBO_FILE),
