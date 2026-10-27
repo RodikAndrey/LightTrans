@@ -89,38 +89,47 @@ impl MelExtractor {
             return (Vec::new(), 0);
         }
         let n_frames = 1 + (n - WIN) / HOP; // center=false
-        let n_bins = N_FFT / 2 + 1;
-
         let mut features = vec![0f32; N_MELS * n_frames];
-
         for t in 0..n_frames {
-            let start = t * HOP;
-            for (i, w) in self.window.iter().enumerate() {
-                self.scratch_input[i] = wav[start + i] * w;
-            }
-            self.fft
-                .process_with_scratch(
-                    &mut self.scratch_input,
-                    &mut self.scratch_out,
-                    &mut self.scratch,
-                )
-                .expect("fft failed");
-
+            let mut frame = [0f32; N_FFT];
+            frame.copy_from_slice(&wav[t * HOP..t * HOP + N_FFT]);
+            let col = self.frame_log_mel(&frame);
             for m in 0..N_MELS {
-                let row = &self.fb[m * n_bins..(m + 1) * n_bins];
-                let mut e = 0f32;
-                for bin in 0..n_bins {
-                    let c = self.scratch_out[bin];
-                    let p = c.re * c.re + c.im * c.im; // power spectrum
-                    e += row[bin] * p;
-                }
-                // torchaudio applies clamp AFTER mel-multiplication in GigaAM's log:
-                // log(clamp(spec, 1e-9, 1e9))
-                let e = e.clamp(1e-9, 1e9);
-                features[m * n_frames + t] = e.ln();
+                features[m * n_frames + t] = col[m];
             }
         }
         (features, n_frames)
+    }
+
+    /// Лог-мел одного окна (N_FFT сэмплов) — покадровый API для
+    /// инкрементального стриминга (src/stream.rs): фреймы считаются по мере
+    /// поступления аудио, результат бит-в-бит совпадает с compute().
+    pub fn frame_log_mel(&mut self, frame: &[f32; N_FFT]) -> [f32; N_MELS] {
+        let n_bins = N_FFT / 2 + 1;
+        for (i, w) in self.window.iter().enumerate() {
+            self.scratch_input[i] = frame[i] * w;
+        }
+        self.fft
+            .process_with_scratch(
+                &mut self.scratch_input,
+                &mut self.scratch_out,
+                &mut self.scratch,
+            )
+            .expect("fft failed");
+        let mut col = [0f32; N_MELS];
+        for m in 0..N_MELS {
+            let row = &self.fb[m * n_bins..(m + 1) * n_bins];
+            let mut e = 0f32;
+            for bin in 0..n_bins {
+                let c = self.scratch_out[bin];
+                let p = c.re * c.re + c.im * c.im; // power spectrum
+                e += row[bin] * p;
+            }
+            // torchaudio applies clamp AFTER mel-multiplication in GigaAM's log:
+            // log(clamp(spec, 1e-9, 1e9))
+            col[m] = e.clamp(1e-9, 1e9).ln();
+        }
+        col
     }
 }
 

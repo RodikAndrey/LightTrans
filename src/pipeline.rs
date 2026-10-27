@@ -14,7 +14,6 @@ use crate::worker::Worker;
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
 
 /// Режим обработки каналов входного потока.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +66,88 @@ pub struct QueueItem {
     pub reply: mpsc::Sender<ChunkOutcome>,
 }
 
+// ---------------------------------------------------------------------------
+// Стриминговая аренда воркера (Фаза 6 PORTING.md): инкрементальная сессия
+// требует эксклюзивного владения ONNX-сессией на всё время WS-соединения.
+// ---------------------------------------------------------------------------
+
+/// Сообщение стримингового протокола воркера.
+pub enum StreamMsg {
+    /// Построить StreamSession и прогреть окно (GPU).
+    Begin {
+        config: crate::stream::StreamConfig,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    /// Подать сэмплы модели (16 кГц mono), получить события тиков.
+    Push {
+        samples: Vec<f32>,
+        reply: mpsc::Sender<Result<Vec<crate::stream::StreamEvent>, String>>,
+    },
+    /// Финальный флаш (клиент прислал `{"type":"end"}`).
+    Flush {
+        reply: mpsc::Sender<Result<Vec<crate::stream::StreamEvent>, String>>,
+    },
+    /// Вернуть воркера в общий цикл.
+    End,
+}
+
+/// Слот аренды одного воркера: канал сообщений + флаг занятости.
+struct StreamSlot {
+    tx: mpsc::Sender<StreamMsg>,
+    leased: Arc<AtomicBool>,
+}
+
+/// Аренда воркера на время WS-стрим-сессии. Воркер может быть занят batch-чанком:
+/// заявка подхватывается между чанками (задержка ≤ длительности одного чанка).
+pub struct StreamLease {
+    tx: mpsc::Sender<StreamMsg>,
+    leased: Arc<AtomicBool>,
+    released: bool,
+}
+
+impl StreamLease {
+    /// Построить сессию и прогреть окно. Блокируется до ответа воркера.
+    pub fn begin(&self, config: crate::stream::StreamConfig) -> Result<(), String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(StreamMsg::Begin { config, reply: reply_tx })
+            .map_err(|_| "stream worker is gone".to_string())?;
+        reply_rx.recv().unwrap_or_else(|_| Err("stream worker dropped begin reply".into()))
+    }
+
+    pub fn push(&self, samples: Vec<f32>) -> Result<Vec<crate::stream::StreamEvent>, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(StreamMsg::Push { samples, reply: reply_tx })
+            .map_err(|_| "stream worker is gone".to_string())?;
+        reply_rx.recv().unwrap_or_else(|_| Err("stream worker dropped push reply".into()))
+    }
+
+    pub fn flush(&self) -> Result<Vec<crate::stream::StreamEvent>, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(StreamMsg::Flush { reply: reply_tx })
+            .map_err(|_| "stream worker is gone".to_string())?;
+        reply_rx.recv().unwrap_or_else(|_| Err("stream worker dropped flush reply".into()))
+    }
+
+    /// Вернуть воркера в общий цикл; после вызова аренда больше не используется.
+    pub fn release(mut self) {
+        self.released = true;
+        let _ = self.tx.send(StreamMsg::End);
+        self.leased.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.tx.send(StreamMsg::End);
+            self.leased.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Параметры воркера на время жизни пула.
 pub struct WorkerOpts {
     pub language: String,
@@ -79,7 +160,8 @@ pub struct WorkerOpts {
 
 /// Пул GPU-воркеров с общей очередью чанков. Ответы развозятся по
 /// per-request каналам (`QueueItem.reply`), поэтому параллельные запросы
-/// не смешивают результаты.
+/// не смешивают результаты. Каждый воркер дополнительно публикует слот
+/// стриминговой аренды (эксклюзивное владение сессией на время WS-сессии).
 pub struct WorkerPool {
     chunk_tx: Mutex<Option<mpsc::Sender<QueueItem>>>,
     _handles: Vec<std::thread::JoinHandle<()>>,
@@ -87,6 +169,7 @@ pub struct WorkerPool {
     /// Живые воркеры (поток, умерший от паники, уменьшает счётчик).
     alive: Arc<AtomicUsize>,
     expected: usize,
+    stream_slots: Mutex<Vec<StreamSlot>>,
 }
 
 impl WorkerPool {
@@ -99,45 +182,26 @@ impl WorkerPool {
         let expected = workers.len();
         let alive = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::with_capacity(expected);
-        while let Some(mut w) = workers.pop() {
+        let mut stream_slots = Vec::with_capacity(expected);
+        while let Some(w) = workers.pop() {
             let rx = Arc::clone(&chunk_rx);
             let language = opts.language.clone();
             let translate = opts.translate;
             let beam = opts.beam_size;
             let nthr = opts.n_threads;
             let metrics = opts.metrics.clone();
+            // персональный канал стриминговой аренды (Фаза 6)
+            let (stream_tx, stream_rx) = mpsc::channel::<StreamMsg>();
+            let leased = Arc::new(AtomicBool::new(false));
+            stream_slots.push(StreamSlot { tx: stream_tx, leased: Arc::clone(&leased) });
             alive.fetch_add(1, Ordering::SeqCst);
             handles.push(std::thread::spawn({
                 let alive = Arc::clone(&alive);
                 move || {
                     let _guard = AliveGuard(alive);
-                    loop {
-                        let item = { rx.lock().unwrap().recv() };
-                        let Ok(item) = item else { break };
-                        // чанк отменённого запроса выбрасываем без инференса
-                        if item.cancel.cancelled() {
-                            if let Some(m) = &metrics {
-                                m.chunk_replied();
-                            }
-                            continue;
-                        }
-                        let t_inf = Instant::now();
-                        let res = w.transcribe(
-                            &item.chunk.samples,
-                            item.chunk.start,
-                            &language,
-                            translate,
-                            beam,
-                            nthr,
-                        );
-                        let secs = t_inf.elapsed().as_secs_f64();
-                        crate::stats::add("инференс", &item.chunk.stats_label, secs);
-                        if let Some(m) = &metrics {
-                            m.observe_inference(secs);
-                            m.chunk_replied();
-                        }
-                        let _ = item.reply.send(ChunkOutcome { chunk: item.chunk, result: res });
-                    }
+                    crate::worker::run_worker_loop(
+                        w, rx, stream_rx, leased, language, translate, beam, nthr, metrics,
+                    );
                 }
             }));
         }
@@ -147,7 +211,28 @@ impl WorkerPool {
             metrics: opts.metrics.clone(),
             alive: Arc::clone(&alive),
             expected,
+            stream_slots: Mutex::new(stream_slots),
         }
+    }
+
+    /// Арендовать свободного воркера под стрим-сессию (эксклюзивно).
+    /// `None` — все воркеры уже арендованы.
+    pub fn lease_stream(&self) -> Option<StreamLease> {
+        let slots = self.stream_slots.lock().unwrap();
+        for slot in slots.iter() {
+            if slot
+                .leased
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(StreamLease {
+                    tx: slot.tx.clone(),
+                    leased: Arc::clone(&slot.leased),
+                    released: false,
+                });
+            }
+        }
+        None
     }
 
     /// Поставить чанк в очередь. `false` — пул закрыт (все воркеры умерли).

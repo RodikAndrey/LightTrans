@@ -115,13 +115,9 @@ impl GigaAmV3 {
         })
     }
 
-    /// Transcribe one chunk; returns a segment with absolute timestamps.
-    pub fn transcribe_chunk(&mut self, samples: &[f32], offset: f64) -> Result<Option<Segment>> {
-        let (features, n_frames) = self.mel.compute(samples);
-        if n_frames == 0 {
-            return Ok(None);
-        }
-
+    /// Прогон энкодера: (logprobs, enc_len, classes). Общий для batch-чанка
+    /// и стримингового окна.
+    fn run_encoder(&mut self, features: Vec<f32>, n_frames: usize) -> Result<(Vec<f32>, usize, usize)> {
         let feats = Tensor::from_array((vec![1i64, 64, n_frames as i64], features))?;
         let lengths = Tensor::from_array((vec![1i64], vec![n_frames as i64]))?;
 
@@ -136,19 +132,20 @@ impl GigaAmV3 {
         };
 
         let (lp_shape, logprobs) = outputs[self.logprobs_out.as_str()].try_extract_tensor::<f32>()?;
+        let logprobs = logprobs.to_vec();
         let enc_len = if let Some(len_out) = &self.lengths_out {
             let (_enc_shape, enc) = outputs[len_out.as_str()].try_extract_tensor::<i64>()?;
             (enc.first().copied().unwrap_or(0)).max(0) as usize
         } else {
             *lp_shape.get(1).context("log_probs rank < 2")? as usize
         };
-        if enc_len == 0 {
-            return Ok(None);
-        }
         let classes = *lp_shape.last().context("log_probs rank < 2")? as usize;
+        Ok((logprobs, enc_len, classes))
+    }
 
-        // CTC greedy: argmax per frame, collapse repeats, drop blanks
-        let mut toks: Vec<(usize, usize, f32)> = Vec::new(); // (frame, id, prob)
+    /// CTC greedy: (фрейм, id, prob) по непустым ненаглым токенам.
+    fn greedy_tokens(&self, logprobs: &[f32], enc_len: usize, classes: usize) -> Vec<(usize, usize, f32)> {
+        let mut toks: Vec<(usize, usize, f32)> = Vec::new();
         let mut prev: i64 = -1;
         for t in 0..enc_len {
             let row = &logprobs[t * classes..(t + 1) * classes];
@@ -165,6 +162,22 @@ impl GigaAmV3 {
             }
             prev = best as i64;
         }
+        toks
+    }
+
+    /// Transcribe one chunk; returns a segment with absolute timestamps.
+    pub fn transcribe_chunk(&mut self, samples: &[f32], offset: f64) -> Result<Option<Segment>> {
+        let (features, n_frames) = self.mel.compute(samples);
+        if n_frames == 0 {
+            return Ok(None);
+        }
+        let (logprobs, enc_len, classes) = self.run_encoder(features, n_frames)?;
+        if enc_len == 0 {
+            return Ok(None);
+        }
+
+        let toks = self.greedy_tokens(&logprobs, enc_len, classes);
+
         if std::env::var("LIGHTTRANS_DEBUG_TOKENS").is_ok() {
             let shift_dbg = samples.len() as f64 / 16_000.0 / enc_len as f64;
             for (t, id, p) in &toks {
@@ -202,6 +215,53 @@ impl GigaAmV3 {
             speaker: None,
             channel: None,
         }))
+    }
+
+    /// Декод одного полного окна мел-признаков для стриминга (src/stream.rs):
+    /// слова в секундах от начала окна + маска тишины (argmax == blank,
+    /// контракт sources' CTC silence mask для endpointing «blank»).
+    pub fn decode_window(
+        &mut self,
+        features: &[f32],
+        n_frames: usize,
+        window_sec: f32,
+    ) -> Result<crate::stream::DecodedWindow> {
+        let (logprobs, enc_len, classes) =
+            self.run_encoder(features.to_vec(), n_frames)?;
+        let frame_rate = enc_len as f32 / window_sec.max(1e-6);
+        let silence: Vec<bool> = if enc_len == 0 {
+            Vec::new()
+        } else {
+            (0..enc_len)
+                .map(|t| {
+                    let row = &logprobs[t * classes..(t + 1) * classes];
+                    let mut best = 0usize;
+                    let mut bv = f32::NEG_INFINITY;
+                    for (i, &v) in row.iter().enumerate() {
+                        if v > bv {
+                            bv = v;
+                            best = i;
+                        }
+                    }
+                    best == self.blank_id
+                })
+                .collect()
+        };
+        let words = if enc_len == 0 {
+            Vec::new()
+        } else {
+            let toks = self.greedy_tokens(&logprobs, enc_len, classes);
+            let shift = window_sec as f64 / enc_len as f64;
+            build_words(&self.vocab, &toks, shift, 0.0)
+                .into_iter()
+                .map(|w| crate::stream::TWord {
+                    text: w.word,
+                    start: w.start as f32,
+                    end: w.end as f32,
+                })
+                .collect()
+        };
+        Ok(crate::stream::DecodedWindow { words, silence, output_frames: enc_len, frame_rate })
     }
 }
 

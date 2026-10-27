@@ -22,6 +22,7 @@ pub mod pipeline;
 pub mod segments;
 pub mod server;
 pub mod stats;
+pub mod stream;
 pub mod transcript;
 pub mod vad;
 pub mod whisper;

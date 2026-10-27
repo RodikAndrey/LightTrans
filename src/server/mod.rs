@@ -16,6 +16,7 @@ pub mod health;
 pub mod http;
 pub mod protocol;
 pub mod response;
+pub mod ws;
 
 use crate::models::ModelPaths;
 use crate::pipeline::WorkerPool;
@@ -71,6 +72,7 @@ pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/v1/transcribe", axum::routing::post(http::transcribe))
         .with_state(state.clone())
+        .route("/v1/stream", axum::routing::get(ws::stream).with_state(state.clone()))
         .route("/health", axum::routing::get(health::health).with_state(state.clone()))
         .route("/livez", axum::routing::get(health::livez))
         .route("/readyz", axum::routing::get(health::readyz).with_state(state.clone()))

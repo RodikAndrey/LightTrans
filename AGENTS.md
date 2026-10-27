@@ -46,15 +46,16 @@ RUST_LOG=debug scripts/run.sh ...                 # подробные логи 
 src/
 ├── main.rs         — CLI (clap): транскрибация + подкоманды `vad`/`bench`; сборка конвейера; фазы --w2v и --diarize; вывод
 ├── lib.rs          — библиотечный корень: общий код CLI и сервера
-├── pipeline.rs     — общий конвейер CLI и сервера: WorkerPool (очередь + ответы по чанкам), MultiStream (mix/split-каналы), отмена
-├── worker.rs       — ModelKind + сборка воркеров (try_build_worker), авто-подбор по VRAM (NVML)
+├── pipeline.rs     — общий конвейер CLI и сервера: WorkerPool (очередь + ответы по чанкам + слоты стрим-аренды), MultiStream (mix/split-каналы), отмена
+├── worker.rs       — ModelKind + сборка воркеров (try_build_worker), цикл воркера (batch-чанки + персональный канал стрим-аренды), авто-подбор по VRAM (NVML)
+├── stream.rs       — инкрементальная CTC-сессия (Фаза 6): log-mel по фреймам, прогоны по окну 30 c с шумовым паддингом, швы окон, endpointing по маске тишины, события words/stable/final
 ├── channels.rs     — «канал = спикер»: корреляция каналов, dual-mono (>0.98), turns по паузам
-├── server/         — HTTP-слой lighttrans-server (axum): /v1/transcribe, admission/draining, строгие env-лимиты, query-грамматика, health/readyz/metrics
+├── server/         — HTTP/WS-слой lighttrans-server (axum): /v1/transcribe, /v1/stream (ws.rs), admission/draining, строгие env-лимиты, query-грамматика, health/readyz/metrics
 ├── metrics.rs      — счётчики/гистограммы Prometheus (lighttrans_*)
 ├── manifest.rs     — манифесты моделей: sha256+размер файлов, IO-имена ONNX (strict, если есть)
 ├── ort_assignment.rs — инспекция назначения узлов ORT (API-24): CPU/CUDA-отпечатки, политика verified/allow-unverified
 ├── audio.rs        — libav* декод: файл/байты/reader → поток блоков mono f32 (16 кГц; 48 кГц при --denoise; все каналы при split)
-├── mel.rs          — log-mel 64×T, бит-в-бит как torchaudio MelSpectrogram (n_fft 320 / hop 160 / HTK)
+├── mel.rs          — log-mel 64×T, бит-в-бит как torchaudio MelSpectrogram (n_fft 320 / hop 160 / HTK); покадровый API frame_log_mel для стрима
 ├── vad.rs          — Silero v5 ONNX (CPU), стриминг, батчи по 64 окна, гистерезис WhisperX (onset/offset 0.5/0.363)
 ├── segments.rs     — стриминг-чанкер (≤ chunk_size, семантика merge_chunks WhisperX); здесь же фикс хвоста декодера
 ├── gigaam.rs       — GigaAM v3 E2E CTC: ONNX Runtime CUDA EP, greedy, слова из CTC-фреймов
@@ -92,6 +93,12 @@ deps/               — cuda13 runtime, ffmpeg 9 shared, референсы (в 
    нарушать этот инвариант.
 4. Опциональные фазы: `--diarize` (параллельно транскрибации), `--w2v` (вторая фаза
    после транскрибации: воркеры выгружаются, затем 2 сессии GigaAM-CTC выравнивают слова).
+5. **WS-стрим** (`server/ws.rs` → `stream.rs`): воркер CTC-пула арендуется сессии
+   **эксклюзивно** (`WorkerPool::lease_stream`), инкрементальная сессия живёт на
+   воркере до End/разрыва; арендованный воркер не берёт batch-чанки. Заявка на
+   аренду подхватывается между чанками (poll 50 мс) — задержка ≤ одного чанка.
+   Нарушать порядок/формат событий (`words` → `stable` → `final`, ревизия с
+   `revise_from`) нельзя — это контракт источника (PORTING.md Фаза 6).
 
 Семантика `stats.rs`: строки сводной таблицы («инференс …, N чанков») — это
 **окна-накопители** (сумма времён по чанкам, окно перекрывается с соседними этапами),
@@ -164,6 +171,14 @@ deps/               — cuda13 runtime, ffmpeg 9 shared, референсы (в 
    загрузку; для RNN-T `io` — объединённая поверхность encoder+decoder+joint,
    сверяется одним вызовом. Пересобирайте манифесты
    `scripts/gen_model_manifest.py` при обновлении весов или ONNX-экспорта.
+
+10. **Терминация WS-сессии требует маркера.** Блокирующая сторона стрима
+    (`run_stream_side`) отвечает в канал `OutMsg`; после флаша по End она
+    обязана послать `OutMsg::Done` — иначе транспортная сторона прочитает
+    устаревшие события тиков вместо финальных. Не убирайте маркер.
+11. **Воркеры и VRAM.** Сервер держит пулы CTC+RNN-T; запуск CLI на той же
+    машине может не влезть в VRAM и уйдёт в CPU-fallback (это штатное
+    поведение CLI, не регрессия).
 
 ## Git
 

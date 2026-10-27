@@ -2,9 +2,13 @@
 //! Код перенесён из `main.rs`, чтобы CLI и сервер использовали общий пул.
 
 use crate::ort_assignment::Policy;
+use crate::stream::{StreamConfig, StreamSession, WindowDecoder};
 use crate::{gigaam, gigaam_rnnt, models, parakeet, whisper};
 use anyhow::Result;
 use clap::ValueEnum;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ModelKind {
@@ -150,5 +154,176 @@ pub fn auto_workers(use_cuda: bool, model: ModelKind) -> usize {
     match free {
         Some(free) => (((free as f64 - 0.8e9) / per_model).floor() as usize).clamp(1, 4),
         None => 2,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Стриминговая аренда (Фаза 6 PORTING.md)
+// ---------------------------------------------------------------------------
+
+/// CTC-декодер полного окна для StreamSession (владелец — GigaAM v3).
+struct CtcStreamDecoder(gigaam::GigaAmV3);
+
+impl WindowDecoder for CtcStreamDecoder {
+    fn decode_window(
+        &mut self,
+        features: &[f32],
+        n_frames: usize,
+        window_sec: f32,
+    ) -> Result<crate::stream::DecodedWindow> {
+        self.0.decode_window(features, n_frames, window_sec)
+    }
+}
+
+/// Построить стрим-сессию на воркере: модель уходит внутрь сессии до End.
+fn begin_stream(
+    worker: &mut Option<Worker>,
+    config: StreamConfig,
+) -> Result<StreamSession<CtcStreamDecoder>> {
+    let g = match worker {
+        Some(Worker::Gigaam(_)) => match worker.take() {
+            Some(Worker::Gigaam(g)) => g,
+            _ => unreachable!("проверено выше"),
+        },
+        Some(other) => {
+            let _ = other;
+            anyhow::bail!("текущая модель воркера не поддерживает стриминг (нужен GigaAM v3 CTC)");
+        }
+        None => anyhow::bail!("воркер без модели"),
+    };
+    let mut session = StreamSession::new(CtcStreamDecoder(g), config)?;
+    session.warmup()?;
+    Ok(session)
+}
+
+/// Цикл одного воркера: общая очередь batch-чанков + персональный канал
+/// стриминговой аренды. Арендованный воркер обслуживает только свой стрим;
+/// заявка на аренду подхватывается между чанками (poll 50 мс). При закрытии
+/// очереди пула воркер дожидается завершения активной аренды и выходит.
+pub fn run_worker_loop(
+    w: Worker,
+    rx: Arc<Mutex<mpsc::Receiver<crate::pipeline::QueueItem>>>,
+    stream_rx: mpsc::Receiver<crate::pipeline::StreamMsg>,
+    leased_flag: Arc<AtomicBool>,
+    language: String,
+    translate: bool,
+    beam: usize,
+    nthr: usize,
+    metrics: Option<Arc<crate::metrics::Metrics>>,
+) {
+    let mut worker: Option<Worker> = Some(w);
+    let mut leased: Option<StreamSession<CtcStreamDecoder>> = None;
+    loop {
+        // 1. арендован: эксклюзивное обслуживание стрим-сессии
+        if let Some(session) = leased.as_mut() {
+            match stream_rx.recv() {
+                Ok(crate::pipeline::StreamMsg::Push { samples, reply }) => {
+                    let t = Instant::now();
+                    let res = session.push(&samples).map_err(|e| format!("{e:#}"));
+                    let secs = t.elapsed().as_secs_f64();
+                    crate::stats::add("инференс (стрим)", "stream", secs);
+                    if let Some(m) = &metrics {
+                        m.observe_inference(secs);
+                    }
+                    let _ = reply.send(res);
+                }
+                Ok(crate::pipeline::StreamMsg::Flush { reply }) => {
+                    let res = session.flush().map_err(|e| format!("{e:#}"));
+                    let _ = reply.send(res);
+                }
+                Ok(crate::pipeline::StreamMsg::Begin { .. }) => {
+                    tracing::warn!("стрим: повторный Begin в арендованном воркере — игнорирую");
+                }
+                Ok(crate::pipeline::StreamMsg::End) | Err(_) => {
+                    if let Some(session) = leased.take() {
+                        worker = Some(Worker::Gigaam(session.into_decoder().0));
+                    }
+                    leased_flag.store(false, Ordering::SeqCst);
+                }
+            }
+            continue;
+        }
+
+        // 2. заявка на аренду (флаг ставит lease_stream до отправки Begin):
+        // выгребаем канал до Begin или пусто (могут быть устаревшие End)
+        if leased_flag.load(Ordering::SeqCst) {
+            let mut leased_now = false;
+            loop {
+                match stream_rx.try_recv() {
+                    Ok(crate::pipeline::StreamMsg::Begin { config, reply }) => {
+                        match begin_stream(&mut worker, config) {
+                            Ok(session) => {
+                                leased = Some(session);
+                                // ответ после построения сессии и прогрева окна
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(e) => {
+                                leased_flag.store(false, Ordering::SeqCst);
+                                let _ = reply.send(Err(format!("{e:#}")));
+                            }
+                        }
+                        leased_now = leased.is_some();
+                        break;
+                    }
+                    Ok(crate::pipeline::StreamMsg::Push { reply, .. })
+                    | Ok(crate::pipeline::StreamMsg::Flush { reply, .. }) => {
+                        let _ = reply.send(Err("stream push/flush before begin".into()));
+                    }
+                    Ok(crate::pipeline::StreamMsg::End) => {
+                        // пустая аренда (арендатор умер до Begin) — ждём дальше
+                    }
+                    Err(_) => break,
+                }
+            }
+            if leased_now {
+                continue;
+            }
+        }
+
+        // 3. общий очередь чанков; короткий тайм-аут, чтобы замечать заявки
+        // на аренду (recv держит мьютекс очереди — как и раньше, один
+        // ждущий воркер не мешает остальным: они блокируются на lock())
+        let item = { rx.lock().unwrap().recv_timeout(Duration::from_millis(50)) };
+        match item {
+            Ok(item) => {
+                // чанк отменённого запроса выбрасываем без инференса
+                if item.cancel.cancelled() {
+                    if let Some(m) = &metrics {
+                        m.chunk_replied();
+                    }
+                    continue;
+                }
+                let t_inf = Instant::now();
+                let res = worker
+                    .as_mut()
+                    .expect("не-арендованный воркер всегда держит модель")
+                    .transcribe(
+                        &item.chunk.samples,
+                        item.chunk.start,
+                        &language,
+                        translate,
+                        beam,
+                        nthr,
+                    );
+                let secs = t_inf.elapsed().as_secs_f64();
+                crate::stats::add("инференс", &item.chunk.stats_label, secs);
+                if let Some(m) = &metrics {
+                    m.observe_inference(secs);
+                    m.chunk_replied();
+                }
+                let _ = item
+                    .reply
+                    .send(crate::pipeline::ChunkOutcome { chunk: item.chunk, result: res });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // очередь пула закрыта: выходим, только если нет аренды;
+                // активная аренда обслуживается до End (см. ветку 1)
+                if !leased_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 }

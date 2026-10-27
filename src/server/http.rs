@@ -161,7 +161,7 @@ type WorkResult = Result<serde_json::Value, WorkError>;
 
 /// Лимит частоты дискретизации: приведённое к несократимому отношение
 /// вход/модель должно оставаться ≤ 1000 с обеих сторон (контракт источника).
-fn rate_compatible(rate: u32, model_rate: u32) -> bool {
+pub(crate) fn rate_compatible(rate: u32, model_rate: u32) -> bool {
     fn gcd(a: u32, b: u32) -> u32 {
         if b == 0 { a } else { gcd(b, a % b) }
     }

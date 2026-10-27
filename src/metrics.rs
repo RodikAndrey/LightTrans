@@ -76,6 +76,13 @@ pub struct Metrics {
     /// Чанки, поставленные в очередь воркеров и ещё не отвеченные.
     worker_pending: AtomicU64,
     max_transcribe: AtomicU64,
+    // WebSocket-стрим (Фаза 6)
+    ws_sessions_total: AtomicU64,
+    ws_frames_total: AtomicU64,
+    ws_errors_total: AtomicU64,
+    ws_rejected_total: AtomicU64,
+    /// Активные WS-сессии.
+    active_ws: AtomicU64,
     lat: Hist,
     lat_inference: Hist,
     lat_decode: Hist,
@@ -134,6 +141,30 @@ impl Metrics {
         self.lat_decode.observe(secs);
     }
 
+    // --- WebSocket-стрим (Фаза 6) ---
+
+    pub fn ws_session_started(&self) {
+        self.ws_sessions_total.fetch_add(1, Relaxed);
+        self.active_ws.fetch_add(1, Relaxed);
+    }
+
+    /// Активность уезжает вместе с арендой/пермитом: до терминации сессии.
+    pub fn ws_session_finished(&self) {
+        self.active_ws.fetch_sub(1, Relaxed);
+    }
+
+    pub fn ws_frame(&self) {
+        self.ws_frames_total.fetch_add(1, Relaxed);
+    }
+
+    pub fn ws_error(&self) {
+        self.ws_errors_total.fetch_add(1, Relaxed);
+    }
+
+    pub fn ws_reject(&self) {
+        self.ws_rejected_total.fetch_add(1, Relaxed);
+    }
+
     /// Текстовый рендер Prometheus (text/plain; version=0.0.4).
     pub fn render(&self) -> String {
         let mut s = String::new();
@@ -155,6 +186,11 @@ impl Metrics {
         gauge!("lighttrans_active_transcribe", c(&self.active_transcribe));
         gauge!("lighttrans_max_transcribe", c(&self.max_transcribe));
         gauge!("lighttrans_worker_pending", c(&self.worker_pending));
+        counter!("lighttrans_ws_sessions_total", c(&self.ws_sessions_total));
+        counter!("lighttrans_ws_frames_total", c(&self.ws_frames_total));
+        counter!("lighttrans_ws_errors_total", c(&self.ws_errors_total));
+        counter!("lighttrans_ws_rejected_total", c(&self.ws_rejected_total));
+        gauge!("lighttrans_active_ws", c(&self.active_ws));
         let _ = writeln!(s, "# TYPE lighttrans_build_info gauge");
         let _ = writeln!(
             s,

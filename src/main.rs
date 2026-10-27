@@ -412,7 +412,7 @@ fn round4(x: f32) -> f64 {
 /// Весь конвейер транскрибации (общее тело запуска без подкоманды и `bench`).
 /// В bench-режиме текст не печатается (quiet уже выставлен), человекочитаемая
 /// сводка уходит в stderr, а в stdout — стабильный json этапов и RTF.
-fn run_transcribe(mut args: TranscribeArgs, bench: bool) -> Result<()> {
+fn run_transcribe(args: TranscribeArgs, bench: bool) -> Result<()> {
     if args.files.is_empty() {
         anyhow::bail!("укажите хотя бы один входной файл");
     }

@@ -247,5 +247,8 @@ ffmpeg shared, `deps/cuda13` и nvcc-сборку whisper.cpp — делать m
   (референсные отпечатки этой машины: CTC `b99c5fae…`, RNNT `a9c3729a…`,
   ORT 1.29 + istupakov gigaam-v3 — совпали с источником)
 - [x] Фаза 5 — CLI `bench`, `vad`
-- [ ] Фаза 6 — WebSocket-стриминг (MVP mono/ctc/words) — требуется отдельное решение
+- [x] Фаза 6 — WebSocket-стриминг (MVP mono/ctc/words): `/v1/stream`, события
+  `words`/`stable`/`final`, endpointing «blank», аренда воркера CTC-пула.
+  Финальная гипотеза совпала с batch (pcm16/f32/alaw); turns/lock/`endpoint=vad`/
+  многоканал — 400 до upgrade (вне MVP-среза)
 - [ ] Фаза 7 — Docker (опционально)
