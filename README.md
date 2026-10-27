@@ -171,6 +171,27 @@ whisper.cpp может упасть на `WHISPER_ASSERT(filter_width < a->ne[2]
 guard в вендоренный whisper.cpp (крейт `whisper-rs-sys`) и принудительно пересобирает его.
 `build.sh` вызывает его автоматически.
 
+## Docker
+
+Multi-stage `Dockerfile` (PORTING.md Фаза 7): сборка в `nvidia/cuda:13.0.2-cudnn-devel`
+(rust, nvcc для whisper.cpp, ffmpeg 9 dev, патч DTW), рантайм — только бинарник +
+рантайм-библиотеки ORT/ffmpeg поверх `nvidia/cuda:13.0.2-cudnn-runtime`. Модели в
+образ не зашиваются — монтируются томом. Требуется `nvidia-container-toolkit` на хосте.
+
+```bash
+docker build -t lighttrans .
+# GPU (verified-политика CUDA — по умолчанию; хеши отпечатков обязательны,
+# см. Фазу 4 в PORTING.md; быстрый старт — allow-unverified печатает их):
+docker run --rm --gpus all -p 9898:9898 -v "$PWD/models:/app/models" \
+    -e ASR_CUDA_ASSIGNMENT_POLICY=allow-unverified lighttrans
+docker run --rm -p 9898:9898 -v "$PWD/models:/app/models" lighttrans --ep cpu   # без GPU
+```
+
+Лимиты `ASR_*` задаются через `--env`/`-e` (значения по умолчанию в образе — как в
+источнике); env верификации CUDA-назначений передаются так же. Отпечатки этой
+сборки ORT/моделей совпадают с референсными (проверено в контейнере:
+CTC `b99c5fae…`, RNNT `a9c3729a…`). SIGTERM/SIGINT → draining → чистый выход 0.
+
 ## Модели
 
 Кладутся в `models/` (можно переопределить `--models-dir`):

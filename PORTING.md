@@ -251,4 +251,6 @@ ffmpeg shared, `deps/cuda13` и nvcc-сборку whisper.cpp — делать m
   `words`/`stable`/`final`, endpointing «blank», аренда воркера CTC-пула.
   Финальная гипотеза совпала с batch (pcm16/f32/alaw); turns/lock/`endpoint=vad`/
   многоканал — 400 до upgrade (вне MVP-среза)
-- [ ] Фаза 7 — Docker (опционально)
+- [x] Фаза 7 — Docker (multi-stage `Dockerfile`: devel-сборка →
+  `nvidia/cuda:13.0.2-cudnn-runtime` + рантайм-библиотеки; модели томом;
+  собран и проверен на этой машине: /health, batch-запрос, GPU-проброс)

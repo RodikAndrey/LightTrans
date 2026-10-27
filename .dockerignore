@@ -1,0 +1,15 @@
+# Контекст сборки минимальный: всё тяжёлое (веса, зависимости, сборка) —
+# мимо. Зависимости (ffmpeg dev, ort, rust) докер-образ качает сам.
+target/
+deps/
+models/**/*.onnx
+models/**/*.bin
+models/**/*.safetensors
+tests/*.mp3
+tests/*.mp4
+tests/*.wav
+tests/*.opus
+tests/*.npy
+tests/_*
+.git/
+.env

@@ -9,6 +9,16 @@
 
 ### Added
 
+- Docker-образ (Фаза 7 PORTING.md, `Dockerfile` + `.dockerignore`): multi-stage —
+  сборка в `nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04` (rustup stable, nvcc для
+  whisper.cpp, ffmpeg 9 shared dev из BtbN, патч DTW), рантайм —
+  `nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04` с бинарником `lighttrans-server`
+  (+ CLI), библиотеками ORT (из OUT_DIR ort-sys) и рантаймом ffmpeg; CUDA 13/cuDNN 9
+  берутся из базового образа (deps/cuda13 нужен только на хосте с системным CUDA 12).
+  Модели не зашиваются — монтируются томом `-v $PWD/models:/app/models`; запуск
+  `docker run --gpus all -p 9898:9898 … lighttrans`, CPU — `--ep cpu`. Непривилегированный
+  пользователь 10001, лимиты ASR_* в ENV, OCI-метки. Кэш-маунты BuildKit для
+  cargo registry/target ускоряют пересборку.
 - `GET /v1/stream` — WebSocket-стриминг (Фаза 6 PORTING.md, MVP-срез: mono,
   `model=ctc`, `emit=words`). Query как у источника: `rate` обязателен
   (8000..192000, отношение к модельной ≤ 1000), `fmt` pcm16|f32|alaw|ulaw,
