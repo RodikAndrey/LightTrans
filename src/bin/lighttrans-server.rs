@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use lighttrans::download;
 use lighttrans::metrics::Metrics;
 use lighttrans::models;
 use lighttrans::ort_assignment::Policy;
@@ -53,9 +54,17 @@ struct Args {
     #[arg(long)]
     no_rnnt: bool,
 
+    /// отключить автозагрузку недостающих моделей из сети
+    #[arg(long)]
+    no_download_models: bool,
+
     /// воркеров на модель (0 = авто по свободной VRAM)
     #[arg(long, default_value_t = 0)]
     workers: usize,
+
+    /// чанков на один прогон CTC-GigaAM (1 = почанково; RNN-T игнорирует)
+    #[arg(long, default_value_t = 4)]
+    batch: usize,
 }
 
 fn main() -> Result<()> {
@@ -79,6 +88,18 @@ fn main() -> Result<()> {
     let policy: Option<Arc<Policy>> = Policy::from_env(use_cuda, !args.no_rnnt)
         .map_err(|e| anyhow::anyhow!("конфигурация окружения: {e}"))?
         .map(Arc::new);
+    // автозагрузка до resolve: манифесты проверяются строго, файлы должны
+    // лежать на месте до верификации; сервер держит пулы CTC (+ RNN-T)
+    let mut need = vec![download::Family::SileroVad, download::Family::GigaamV3Ctc];
+    if !args.no_rnnt {
+        need.push(download::Family::GigaamV3Rnnt);
+    }
+    download::ensure(
+        &models::base_dir(args.models_dir.as_deref()),
+        &need,
+        !args.no_download_models,
+    )
+    .with_context(|| "автозагрузка моделей")?;
     let paths = models::resolve(args.models_dir.as_deref())?;
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -134,6 +155,7 @@ fn main() -> Result<()> {
             translate: false,
             beam_size: 1,
             n_threads: if use_cuda { 4 } else { cores },
+            batch: args.batch,
             metrics: Some(Arc::clone(&metrics)),
         };
         let workers = load_model(kind, use_cuda)?;

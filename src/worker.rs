@@ -198,8 +198,14 @@ fn begin_stream(
 
 /// Цикл одного воркера: общая очередь batch-чанков + персональный канал
 /// стриминговой аренды. Арендованный воркер обслуживает только свой стрим;
-/// заявка на аренду подхватывается между чанками (poll 50 мс). При закрытии
+/// заявка на аренду подхватывается между прогонами (poll 50 мс; при батчах
+/// — между батчами, т.е. не позже обработки ≤ batch чанков). При закрытии
 /// очереди пула воркер дожидается завершения активной аренды и выходит.
+///
+/// `batch > 1`: CTC-GigaAM воркер добирает чанки из очереди без ожидания
+/// и гонит их одним прогоном ONNX (см. `GigaAmV3::transcribe_chunks`);
+/// остальные бэкенды параметр игнорируют.
+#[allow(clippy::too_many_arguments)]
 pub fn run_worker_loop(
     w: Worker,
     rx: Arc<Mutex<mpsc::Receiver<crate::pipeline::QueueItem>>>,
@@ -209,6 +215,7 @@ pub fn run_worker_loop(
     translate: bool,
     beam: usize,
     nthr: usize,
+    batch: usize,
     metrics: Option<Arc<crate::metrics::Metrics>>,
 ) {
     let mut worker: Option<Worker> = Some(w);
@@ -293,27 +300,87 @@ pub fn run_worker_loop(
                     }
                     continue;
                 }
+                // Батч-инференс: первый чанк + добор из очереди без ожидания.
+                // Батчи собираются только из уже готовых чанков — ожидания и
+                // задержек нет; при пустой очереди воркер работает как раньше.
+                let mut items = vec![item];
+                if batch > 1 {
+                    loop {
+                        if items.len() >= batch {
+                            break;
+                        }
+                        match rx.lock().unwrap().try_recv() {
+                            Ok(next) => {
+                                if next.cancel.cancelled() {
+                                    if let Some(m) = &metrics {
+                                        m.chunk_replied();
+                                    }
+                                    continue;
+                                }
+                                items.push(next);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+
                 let t_inf = Instant::now();
-                let res = worker
-                    .as_mut()
-                    .expect("не-арендованный воркер всегда держит модель")
-                    .transcribe(
-                        &item.chunk.samples,
-                        item.chunk.start,
-                        &language,
-                        translate,
-                        beam,
-                        nthr,
-                    );
+                let results: Vec<anyhow::Result<(Vec<crate::transcript::Segment>, Option<String>)>> = {
+                    let w = worker
+                        .as_mut()
+                        .expect("не-арендованный воркер всегда держит модель");
+                    match w {
+                        // CTC GigaAM — единственный бэкенд с батч-прогоном;
+                        // остальные (whisper/RNN-T/parakeet) — почанково
+                        Worker::Gigaam(g) if items.len() > 1 => {
+                            let refs: Vec<&[f32]> =
+                                items.iter().map(|i| i.chunk.samples.as_slice()).collect();
+                            let offs: Vec<f64> = items.iter().map(|i| i.chunk.start).collect();
+                            match g.transcribe_chunks(&refs, &offs) {
+                                Ok(segs) => segs
+                                    .into_iter()
+                                    .map(|s| Ok((s.map(|s| vec![s]).unwrap_or_default(), None)))
+                                    .collect(),
+                                Err(e) => {
+                                    let msg = format!("{e:#}");
+                                    items.iter()
+                                        .map(|_| Err(anyhow::anyhow!("{msg}")))
+                                        .collect()
+                                }
+                            }
+                        }
+                        w => items
+                            .iter()
+                            .map(|item| {
+                                w.transcribe(
+                                    &item.chunk.samples,
+                                    item.chunk.start,
+                                    &language,
+                                    translate,
+                                    beam,
+                                    nthr,
+                                )
+                            })
+                            .collect(),
+                    }
+                };
                 let secs = t_inf.elapsed().as_secs_f64();
-                crate::stats::add("инференс", &item.chunk.stats_label, secs);
+                // окно-накопитель статистики: время батча делится по чанкам,
+                // чтобы сводная таблица оставалась сопоставимой с batch=1
+                let per_chunk = secs / items.len() as f64;
                 if let Some(m) = &metrics {
                     m.observe_inference(secs);
-                    m.chunk_replied();
                 }
-                let _ = item
-                    .reply
-                    .send(crate::pipeline::ChunkOutcome { chunk: item.chunk, result: res });
+                for (item, res) in items.into_iter().zip(results.into_iter()) {
+                    crate::stats::add("инференс", &item.chunk.stats_label, per_chunk);
+                    if let Some(m) = &metrics {
+                        m.chunk_replied();
+                    }
+                    let _ = item.reply.send(crate::pipeline::ChunkOutcome {
+                        chunk: item.chunk,
+                        result: res,
+                    });
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {

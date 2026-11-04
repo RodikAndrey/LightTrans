@@ -9,6 +9,7 @@ pub mod audio;
 pub mod channels;
 pub mod df;
 pub mod diarize;
+pub mod download;
 pub mod gigaam;
 pub mod gigaam_rnnt;
 pub mod manifest;

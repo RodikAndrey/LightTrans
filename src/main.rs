@@ -17,7 +17,7 @@ use lighttrans::pipeline::{
 use lighttrans::segments::Chunk;
 use lighttrans::transcript::{join_word_texts, Segment, Transcript, Word};
 use lighttrans::worker::{auto_workers, try_build_worker, ModelKind, Worker};
-use lighttrans::{align, audio, channels, df, diarize, models, output, pipeline, stats, transcript, vad};
+use lighttrans::{align, audio, channels, df, diarize, download, models, output, pipeline, stats, transcript, vad};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -147,6 +147,15 @@ struct TranscribeArgs {
     #[arg(short, long)]
     quiet: bool,
 
+    /// чанков на один прогон CTC-GigaAM (1 = почанково; whisper/RNN-T/
+    /// parakeet игнорируют)
+    #[arg(long, default_value_t = 4)]
+    batch: usize,
+
+    /// отключить автозагрузку недостающих моделей из сети
+    #[arg(long)]
+    no_download_models: bool,
+
     /// показать справку и выйти
     #[arg(short = 'h', long)]
     help: bool,
@@ -174,6 +183,10 @@ enum Cmd {
         /// каталог с моделями
         #[arg(long)]
         models_dir: Option<PathBuf>,
+
+        /// отключить автозагрузку недостающих моделей из сети
+        #[arg(long)]
+        no_download_models: bool,
     },
     /// прогон транскрибации с машиночитаемой сводкой этапов и RTF
     /// (json в stdout, таблица — в stderr, текст не печатается)
@@ -324,8 +337,15 @@ fn main() -> Result<()> {
     init_tracing(bench);
 
     match cli.command {
-        Some(Cmd::Vad { files, output, vad_onset, vad_offset, models_dir }) => {
-            return run_vad(&files, output.as_deref(), vad_onset, vad_offset, models_dir.as_deref());
+        Some(Cmd::Vad { files, output, vad_onset, vad_offset, models_dir, no_download_models }) => {
+            return run_vad(
+                &files,
+                output.as_deref(),
+                vad_onset,
+                vad_offset,
+                models_dir.as_deref(),
+                no_download_models,
+            );
         }
         Some(Cmd::Bench { tr }) => {
             // bench — это транскрибация без печати текста и с json-сводкой
@@ -362,10 +382,17 @@ fn run_vad(
     vad_onset: f32,
     vad_offset: f32,
     models_dir: Option<&std::path::Path>,
+    no_download_models: bool,
 ) -> Result<()> {
     if files.is_empty() {
         anyhow::bail!("укажите хотя бы один входной файл");
     }
+    download::ensure(
+        &models::base_dir(models_dir),
+        &[download::Family::SileroVad],
+        !no_download_models,
+    )
+    .with_context(|| "автозагрузка моделей")?;
     let paths = models::resolve(models_dir)?;
     let many = files.len() > 1;
     for file in files {
@@ -433,6 +460,25 @@ fn run_transcribe(args: TranscribeArgs, bench: bool) -> Result<()> {
         );
     }
 
+    // автозагрузка до resolve: манифесты проверяются строго, файлы должны
+    // лежать на месте до верификации
+    let mut need = vec![
+        download::Family::SileroVad,
+        download::Family::from(args.model),
+    ];
+    if args.diarize {
+        need.push(download::Family::NemotronDiar);
+    }
+    if args.w2v && args.model == ModelKind::WhisperTurbo {
+        // выравниватель --w2v — это GigaAM CTC (см. align.rs)
+        need.push(download::Family::GigaamV3Ctc);
+    }
+    download::ensure(
+        &models::base_dir(args.models_dir.as_deref()),
+        &need,
+        !args.no_download_models,
+    )
+    .with_context(|| "автозагрузка моделей")?;
     let paths = models::resolve(args.models_dir.as_deref())?;
     let use_cuda_requested = match args.device.as_str() {
         "cuda" | "gpu" => true,
@@ -555,6 +601,7 @@ fn run_transcribe(args: TranscribeArgs, bench: bool) -> Result<()> {
             translate,
             beam_size: args.beam_size,
             n_threads: if use_cuda { 4 } else { cores },
+            batch: args.batch,
             metrics: None,
         },
     ));

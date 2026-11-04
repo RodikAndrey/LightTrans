@@ -143,6 +143,42 @@ impl GigaAmV3 {
         Ok((logprobs, enc_len, classes))
     }
 
+    /// Прогон энкодера батчем: features — [B, 64, T_max], lengths — [B].
+    /// Возвращает (logprobs [B x T_enc_max x classes], T_enc_max, classes);
+    /// валидная длина каждого элемента — `enc_frames(lengths[i])`.
+    fn run_encoder_batch(
+        &mut self,
+        features: Vec<f32>,
+        lengths: &[i64],
+        t_max: usize,
+    ) -> Result<(Vec<f32>, usize, usize)> {
+        let b = lengths.len();
+        let feats = Tensor::from_array((vec![b as i64, 64, t_max as i64], features))?;
+        let lens = Tensor::from_array((vec![b as i64], lengths.to_vec()))?;
+
+        let outputs = if self.input_names.len() >= 2 {
+            let n0 = self.input_names[0].clone();
+            let n1 = self.input_names[1].clone();
+            self.session
+                .run(ort::inputs![n0.as_str() => feats, n1.as_str() => lens])?
+        } else {
+            self.session
+                .run(ort::inputs!["features" => feats, "feature_lengths" => lens])?
+        };
+
+        let (lp_shape, logprobs) = outputs[self.logprobs_out.as_str()]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow::anyhow!("log_probs: {e}"))?;
+        anyhow::ensure!(
+            lp_shape.len() == 3 && lp_shape[0] as usize == b,
+            "log_probs: неожиданная форма {lp_shape:?} для батча {b}"
+        );
+        let logprobs = logprobs.to_vec();
+        let enc_max = *lp_shape.get(1).context("log_probs rank < 2")? as usize;
+        let classes = *lp_shape.last().context("log_probs rank < 2")? as usize;
+        Ok((logprobs, enc_max, classes))
+    }
+
     /// CTC greedy: (фрейм, id, prob) по непустым ненаглым токенам.
     fn greedy_tokens(&self, logprobs: &[f32], enc_len: usize, classes: usize) -> Vec<(usize, usize, f32)> {
         let mut toks: Vec<(usize, usize, f32)> = Vec::new();
@@ -194,27 +230,69 @@ impl GigaAmV3 {
         let dur = samples.len() as f64 / 16_000.0;
         let shift = dur / enc_len as f64; // seconds per encoder frame (~40 ms)
 
-        let raw_text: String = toks
-            .iter()
-            .map(|&(_, id, _)| self.vocab[id].clone())
-            .collect::<Vec<_>>()
-            .join("")
-            .replace('▁', " ");
-        let text = raw_text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if text.is_empty() {
-            return Ok(None);
+        Ok(toks_to_segment(&self.vocab, &toks, shift, offset, dur))
+    }
+
+    /// Батч-инференс (roadmap «Batched-инференс GigaAM»): несколько чанков за
+    /// один прогон ONNX (динамический batch-размер экспорта). Чанки добиваются
+    /// нулями до максимальной длины в батче, результат каждого режется по
+    /// своей mel-длине (формула субдискретизации ×4, проверена тестом).
+    ///
+    /// Семантика как у WhisperX batch_size: из-за паддинга хвост чанка рядом
+    /// с нулями может минимально отличаться от одиночного прогона
+    /// (неказуальные свёртки конформера); текст/тайминги в середине чанка
+    /// бит-в-бит совпадают.
+    pub fn transcribe_chunks(
+        &mut self,
+        chunks: &[&[f32]],
+        offsets: &[f64],
+    ) -> Result<Vec<Option<Segment>>> {
+        anyhow::ensure!(chunks.len() == offsets.len(), "chunks/offsets длины разъехались");
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        if chunks.len() == 1 {
+            // одиночный чанк — старый путь без паддинга (бит-в-бит как раньше)
+            let seg = self.transcribe_chunk(chunks[0], offsets[0])?;
+            return Ok(vec![seg]);
         }
 
-        let words = build_words(&self.vocab, &toks, shift, offset);
+        let mels: Vec<(Vec<f32>, usize)> = chunks
+            .iter()
+            .map(|&s| self.mel.compute(s))
+            .collect();
+        let t_max = mels.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        if t_max == 0 {
+            return Ok(vec![None; chunks.len()]);
+        }
 
-        Ok(Some(Segment {
-            start: offset,
-            end: offset + dur,
-            text,
-            words,
-            speaker: None,
-            channel: None,
-        }))
+        // [B, 64, T_max]: добивка в конце каждой временной оси
+        let mut feats = vec![0f32; chunks.len() * 64 * t_max];
+        for (e, (features, n)) in mels.iter().enumerate() {
+            for m in 0..64 {
+                let src = &features[m * n..m * n + *n];
+                let dst = &mut feats[e * 64 * t_max + m * t_max..e * 64 * t_max + m * t_max + *n];
+                dst.copy_from_slice(src);
+            }
+        }
+        let lengths: Vec<i64> = mels.iter().map(|(_, n)| *n as i64).collect();
+
+        let (logprobs, enc_lens_max, classes) = self.run_encoder_batch(feats, &lengths, t_max)?;
+
+        let mut out = Vec::with_capacity(chunks.len());
+        for (e, (_, n)) in mels.iter().enumerate() {
+            let enc_len = enc_frames(*n).min(enc_lens_max);
+            if enc_len == 0 {
+                out.push(None);
+                continue;
+            }
+            let rows = &logprobs[e * enc_lens_max * classes..(e + 1) * enc_lens_max * classes];
+            let toks = self.greedy_tokens(rows, enc_len, classes);
+            let dur = chunks[e].len() as f64 / 16_000.0;
+            let shift = dur / enc_len as f64;
+            out.push(toks_to_segment(&self.vocab, &toks, shift, offsets[e], dur));
+        }
+        Ok(out)
     }
 
     /// Декод одного полного окна мел-признаков для стриминга (src/stream.rs):
@@ -327,6 +405,47 @@ pub(crate) fn build_words(
     words
 }
 
+/// Число энкодерных фреймов для n мел-фреймов: субдискретизация ×4
+/// (мел 100 fps → энкодер ~25 fps, ~40 мс на фрейм). Формула сверена
+/// с фактической длиной выхода модели на тестовых длинах — см. тест
+/// `subsampling_formula_matches_model` (нужна модель).
+pub(crate) fn enc_frames(n_mel: usize) -> usize {
+    n_mel.div_ceil(4)
+}
+
+/// Сборка сегмента из greedy-токенов: нормализация текста (▁ → пробел),
+/// слова с таймингами. Общий для одиночного и батч-путей.
+fn toks_to_segment(
+    vocab: &[String],
+    toks: &[(usize, usize, f32)],
+    shift: f64,
+    offset: f64,
+    dur: f64,
+) -> Option<Segment> {
+    if toks.is_empty() {
+        return None;
+    }
+    let raw_text: String = toks
+        .iter()
+        .map(|&(_, id, _)| vocab[id].clone())
+        .collect::<Vec<_>>()
+        .join("")
+        .replace('▁', " ");
+    let text = raw_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    let words = build_words(vocab, toks, shift, offset);
+    Some(Segment {
+        start: offset,
+        end: offset + dur,
+        text,
+        words,
+        speaker: None,
+        channel: None,
+    })
+}
+
 /// Vocab file format: "<piece> <id>" per line (e.g. "▁ 1"). Pieces never contain
 /// plain spaces (sentencepiece), so parse from the right. Returns (vocab, blank_id);
 /// the blank token is the one with the highest id ("<blk> 256" in the official file).
@@ -347,4 +466,131 @@ pub(crate) fn load_vocab(path: &Path) -> Result<(Vec<String>, usize)> {
     let blank_id = pairs.last().map(|&(id, _)| id).context("empty vocab")?;
     let vocab = pairs.into_iter().map(|(_, p)| p).collect();
     Ok((vocab, blank_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_model() -> Result<GigaAmV3> {
+        let dir = Path::new("models/gigaam-v3");
+        GigaAmV3::load(
+            &dir.join(GIGAAM_ONNX),
+            &dir.join("v3_e2e_ctc_vocab.txt"),
+            false, // CPU EP: детерминированно и без требования GPU в тестах
+            4,
+            None,
+        )
+    }
+
+    const GIGAAM_ONNX: &str = "v3_e2e_ctc.onnx";
+
+    /// Детерминированный псевдошум (LCG) — контент не важен, важна
+    /// воспроизводимость: сравниваем одиночный и батч-прогоны одной модели.
+    fn noise(n: usize, seed: u32) -> Vec<f32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((x >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Формула субдискретизации ×4 обязана совпадать с фактической длиной
+    /// выхода модели на всём диапазоне длин (иначе батч-путь порежет
+    /// log_probs не там).
+    #[test]
+    #[ignore = "нужна модель models/gigaam-v3"]
+    fn subsampling_formula_matches_model() {
+        let mut g = load_model().unwrap();
+        for n_samples in [16_000usize, 37_333, 160_000, 301_111, 479_900]
+            .into_iter()
+            .chain((96..=104).chain(996..=1004).chain(2996..=3004).map(|nf| (nf - 1) * 160 + 400)) {
+            let (features, n_frames) = g.mel.compute(&noise(n_samples, 7));
+            let (logprobs, enc_len, classes) = g.run_encoder(features, n_frames).unwrap();
+            assert_eq!(logprobs.len(), enc_len * classes);
+            assert_eq!(
+                enc_len,
+                enc_frames(n_frames),
+                "n_mel={n_frames}: модель дала {enc_len}, формула {}",
+                enc_frames(n_frames)
+            );
+        }
+    }
+
+    /// Батч из реальных речевых чанков разной длины (фикстуры tests/_dlg_*,
+    /// склеенные до разной длительности): текст и тайминги слов обязаны
+    /// совпасть с одиночными прогонами. На реальной речи аргмаксы уверенные —
+    /// паддинг не должен их переворачивать (шум не годится: там CTC на грани
+    /// и Any сравнение бессмысленно).
+    #[test]
+    #[ignore = "нужна модель models/gigaam-v3 и фикстуры tests/_dlg_*.wav"]
+    fn batch_matches_single_runs() {
+        let mut g = load_model().unwrap();
+        let decode = |name: &str| -> Vec<f32> {
+            let mut out = Vec::new();
+            let path = std::path::Path::new("tests").join(name);
+            crate::audio::decode_streaming(&path, crate::audio::TARGET_SR, 16_000, |block| {
+                out.extend_from_slice(block);
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        // 30 c из двух длинных реплик, ~17 c, ~5 c, ~22 c
+        let d0 = decode("_dlg_0.wav");
+        let d1 = decode("_dlg_1.wav");
+        let d2 = decode("_dlg_2.wav");
+        let d3 = decode("_dlg_3.wav");
+        let mut long = d0.clone();
+        long.extend_from_slice(&d1);
+        long.extend_from_slice(&d0);
+        long.truncate(30 * 16_000);
+        let chunks: Vec<Vec<f32>> = vec![
+            long,
+            {
+                let mut v = d1.clone();
+                v.extend_from_slice(&d2);
+                v.truncate((17.3 * 16_000.0) as usize);
+                v
+            },
+            d2.clone(),
+            {
+                let mut v = d3.clone();
+                v.extend_from_slice(&d0);
+                v.truncate((22.7 * 16_000.0) as usize);
+                v
+            },
+        ];
+        let offsets: Vec<f64> = vec![0.0, 100.0, 250.5, 999.0];
+
+        let singles: Vec<Option<Segment>> = chunks
+            .iter()
+            .zip(&offsets)
+            .map(|(c, &o)| g.transcribe_chunk(c, o).unwrap())
+            .collect();
+        assert!(
+            singles.iter().filter_map(|s| s.as_ref()).all(|s| !s.words.is_empty()),
+            "фикстуры должны давать слова"
+        );
+        let refs: Vec<&[f32]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let batched = g.transcribe_chunks(&refs, &offsets).unwrap();
+
+        for (i, (single, batch)) in singles.iter().zip(&batched).enumerate() {
+            let (Some(a), Some(b)) = (single, batch) else {
+                panic!("чанк {i}: Some/None разъехались");
+            };
+            assert_eq!(a.text, b.text, "чанк {i}: текст разъехался");
+            assert_eq!(a.words.len(), b.words.len(), "чанк {i}: число слов");
+            for (wa, wb) in a.words.iter().zip(&b.words) {
+                assert_eq!(wa.word, wb.word, "чанк {i}");
+                assert!(
+                    (wa.start - wb.start).abs() < 0.05 && (wa.end - wb.end).abs() < 0.05,
+                    "чанк {i}: тайминг «{}»: {}..{} vs {}..{}",
+                    wa.word, wa.start, wa.end, wb.start, wb.end
+                );
+            }
+        }
+    }
 }

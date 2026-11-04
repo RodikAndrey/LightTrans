@@ -75,15 +75,37 @@ impl ModelManifest {
     /// Проверить все файлы манифеста: существование, размер, sha256.
     /// Ошибка называет файл, ожидаемое и фактическое.
     pub fn verify_files(&self, dir: &Path) -> Result<()> {
+        self.verify_files_impl(dir, false).map(|_| ())
+    }
+
+    /// Проверить строго только присутствующие файлы, отсутствующие вернуть
+    /// списком (пути из манифеста). Присутствующий, но битый/подменённый
+    /// файл по-прежнему отказывает. Отсутствие — не «расхождение»: в git
+    /// коммитятся манифесты без весов, а недокачанные семьи автозагрузка
+    /// доставляет перед использованием (src/download.rs).
+    pub fn verify_files_partial(&self, dir: &Path) -> Result<Vec<String>> {
+        self.verify_files_impl(dir, true)
+    }
+
+    fn verify_files_impl(&self, dir: &Path, skip_missing: bool) -> Result<Vec<String>> {
+        let mut missing = Vec::new();
         for entry in &self.files {
             let path = dir.join(&entry.path);
-            let meta = std::fs::metadata(&path).with_context(|| {
-                format!(
-                    "манифест {}: файл отсутствует: {}",
-                    dir.join(MANIFEST_FILE).display(),
-                    path.display()
-                )
-            })?;
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) if skip_missing => {
+                    missing.push(entry.path.clone());
+                    let _ = e;
+                    continue;
+                }
+                Err(_) => {
+                    bail!(
+                        "манифест {}: файл отсутствует: {}",
+                        dir.join(MANIFEST_FILE).display(),
+                        path.display()
+                    );
+                }
+            };
             if let Some(size) = entry.size {
                 if meta.len() != size {
                     bail!(
@@ -105,7 +127,7 @@ impl ModelManifest {
                 );
             }
         }
-        Ok(())
+        Ok(missing)
     }
 
     /// Сверить фактические имена input/output ONNX-графа с манифестом.

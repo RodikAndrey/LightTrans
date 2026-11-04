@@ -154,6 +154,9 @@ pub struct WorkerOpts {
     pub translate: bool,
     pub beam_size: usize,
     pub n_threads: usize,
+    /// Чанков на один прогон CTC-GigaAM (1 = почанково). Остальные
+    /// бэкенды игнорируют.
+    pub batch: usize,
     /// Метрики сервера (CLI передаёт None).
     pub metrics: Option<Arc<Metrics>>,
 }
@@ -189,6 +192,7 @@ impl WorkerPool {
             let translate = opts.translate;
             let beam = opts.beam_size;
             let nthr = opts.n_threads;
+            let batch = opts.batch;
             let metrics = opts.metrics.clone();
             // персональный канал стриминговой аренды (Фаза 6)
             let (stream_tx, stream_rx) = mpsc::channel::<StreamMsg>();
@@ -200,7 +204,7 @@ impl WorkerPool {
                 move || {
                     let _guard = AliveGuard(alive);
                     crate::worker::run_worker_loop(
-                        w, rx, stream_rx, leased, language, translate, beam, nthr, metrics,
+                        w, rx, stream_rx, leased, language, translate, beam, nthr, batch, metrics,
                     );
                 }
             }));

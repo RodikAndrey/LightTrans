@@ -1,6 +1,6 @@
 [package]
 name = "lighttrans"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Fast GPU audio/video transcription (WhisperX-style pipeline) in Rust: GigaAM v3 E2E CTC + Whisper Large v3 Turbo"
 
@@ -33,6 +33,9 @@ rubato = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# автозагрузка недостающих моделей (HuggingFace resolve / GitHub raw):
+# синхронный клиент на rustls — без openssl, сетевой путь не в async-контексте
+ureq = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 whisper-rs = { version = "0.16.0", features = ["cuda", "raw-api"] }

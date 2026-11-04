@@ -167,36 +167,7 @@ impl Diarization {
     /// Speaker-activity segments, speakers ordered by first arrival (threshold 0.5,
     /// same boundary semantics as the HF processor's `extract_speaker_dict`).
     pub fn segments(&self, threshold: f32) -> Vec<DiarSegment> {
-        let mut segs = Vec::new();
-        for s in 0..self.num_speakers {
-            let mut cur: Option<usize> = None;
-            for f in 0..self.num_frames {
-                let active = self.probs[f * self.num_speakers + s] > threshold;
-                match (cur, active) {
-                    (None, true) => cur = Some(f),
-                    (Some(st), false) => {
-                        segs.push(DiarSegment {
-                            start: st as f64 * FRAME_S,
-                            end: f as f64 * FRAME_S,
-                            speaker: s,
-                        });
-                        cur = None;
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(st) = cur {
-                segs.push(DiarSegment {
-                    start: st as f64 * FRAME_S,
-                    end: self.num_frames as f64 * FRAME_S,
-                    speaker: s,
-                });
-            }
-        }
-        segs.sort_by(|a, b| {
-            a.start.partial_cmp(&b.start).unwrap().then(a.speaker.cmp(&b.speaker))
-        });
-        segs
+        frame_segments(&self.probs, self.num_frames, self.num_speakers, threshold)
     }
 
     /// Speaker of a time span: highest summed probability over its frames.
@@ -225,6 +196,216 @@ impl Diarization {
 // ---------------------------------------------------------------------------
 // Diarizer
 // ---------------------------------------------------------------------------
+
+/// Speaker-activity segments: per-speaker runs above `threshold`, ordered by
+/// start (ties — by slot). Общая для `Diarization::segments` и кластеризации.
+fn frame_segments(
+    probs: &[f32],
+    num_frames: usize,
+    num_speakers: usize,
+    threshold: f32,
+) -> Vec<DiarSegment> {
+    let mut segs = Vec::new();
+    for s in 0..num_speakers {
+        let mut cur: Option<usize> = None;
+        for f in 0..num_frames {
+            let active = probs[f * num_speakers + s] > threshold;
+            match (cur, active) {
+                (None, true) => cur = Some(f),
+                (Some(st), false) => {
+                    segs.push(DiarSegment {
+                        start: st as f64 * FRAME_S,
+                        end: f as f64 * FRAME_S,
+                        speaker: s,
+                    });
+                    cur = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(st) = cur {
+            segs.push(DiarSegment {
+                start: st as f64 * FRAME_S,
+                end: num_frames as f64 * FRAME_S,
+                speaker: s,
+            });
+        }
+    }
+    segs.sort_by(|a, b| {
+        a.start.partial_cmp(&b.start).unwrap().then(a.speaker.cmp(&b.speaker))
+    });
+    segs
+}
+
+/// Порог косинусной близости реплик для склейки слотов (roadmap
+/// «переназначение меток спикеров по кластерам»: при >2 спикерах Sortformer
+/// может дробить один голос на несколько слотов). Консервативный: слоты
+/// одного голоса близки заметно сильнее, разных голосов — дальше.
+pub const CLUSTER_SIM: f32 = 0.8;
+
+/// Переприсвоение меток слотов кластеризацией эмбеддингов реплик.
+///
+/// Реплика = средний нормированный post-embedder эмбеддинг по строкам,
+/// перекрывающим сегмент (строка = `sub` кадров = 80 мс). Агломеративная
+/// кластеризация с центроидной связностью и косинусной мерой, порог
+/// `CLUSTER_SIM`; детерминирована (первая лучшая пара в порядке индексов).
+/// Новые метки — по времени первого появления кластера; колонки probs
+/// переписываются (max по слотам кластера), нумерация и низ конвейера
+/// (`segments`/`speaker_for_span`) остаются прежними. Только склейка:
+/// кластеров не бывает больше, чем исходных слотов.
+fn refine_speakers(
+    probs: &mut [f32],
+    num_frames: usize,
+    nspk: usize,
+    sub: usize,
+    embeds: &[f32],
+) {
+    if num_frames == 0 || nspk == 0 || sub == 0 {
+        return;
+    }
+    let n_rows = embeds.len() / HIDDEN;
+    let segs = frame_segments(probs, num_frames, nspk, 0.5);
+    // склеивать есть смысл только при ≥2 репликах; на огромных файлах
+    // ограничиваем квадратичную кластеризацию
+    if segs.len() < 2 || segs.len() > 5000 {
+        return;
+    }
+
+    // эмбеддинг реплики: L2-нормированное среднее по перекрывающимся строкам
+    let mut unit: Vec<Vec<f32>> = Vec::with_capacity(segs.len());
+    for seg in &segs {
+        let r0 = ((seg.start / FRAME_S) as usize / sub).min(n_rows.saturating_sub(1));
+        let r1 = (((seg.end / FRAME_S) as usize).div_ceil(sub)).clamp(r0 + 1, n_rows);
+        let mut acc = vec![0f32; HIDDEN];
+        for r in r0..r1 {
+            let row = &embeds[r * HIDDEN..(r + 1) * HIDDEN];
+            for (a, &v) in acc.iter_mut().zip(row) {
+                *a += v;
+            }
+        }
+        let norm = acc.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 1e-6 {
+            for v in &mut acc {
+                *v /= norm;
+            }
+            unit.push(acc);
+        } else {
+            unit.push(Vec::new());
+        }
+    }
+
+    // центроиды кластеров; близость пар кластеров считается на лету
+    let n = segs.len();
+
+    // агломеративная кластеризация: центроидная связность, порог CLUSTER_SIM
+    #[derive(Clone)]
+    struct Cluster {
+        members: Vec<usize>,
+        centroid: Vec<f32>,
+        arrival: f64,
+    }
+    let mut clusters: Vec<Cluster> = unit
+        .iter()
+        .enumerate()
+        .map(|(i, u)| Cluster {
+            members: vec![i],
+            centroid: u.clone(),
+            arrival: segs[i].start,
+        })
+        .collect();
+    loop {
+        let mut best: Option<(f32, usize, usize)> = None;
+        for a in 0..clusters.len() {
+            for b in (a + 1)..clusters.len() {
+                if clusters[a].centroid.is_empty() || clusters[b].centroid.is_empty() {
+                    continue;
+                }
+                let (ca, cb) = (&clusters[a].centroid, &clusters[b].centroid);
+                let c: f32 = ca.iter().zip(cb).map(|(x, y)| x * y).sum();
+                // строго больше: при равенстве побеждает первая пара в порядке
+                // индексов — полная детерминированность
+                if c >= CLUSTER_SIM && best.map_or(true, |(bc, ..)| c > bc) {
+                    best = Some((c, a, b));
+                }
+            }
+        }
+        let Some((_, a, b)) = best else { break };
+        let (na, nb) = (clusters[a].members.len(), clusters[b].members.len());
+        let merged = std::mem::take(&mut clusters[b].members);
+        clusters[a].members.extend(merged);
+        let cb = std::mem::take(&mut clusters[b].centroid);
+        let total = (na + nb) as f32;
+        for (x, vb) in clusters[a].centroid.iter_mut().zip(cb) {
+            *x = (*x * na as f32 + vb * nb as f32) / total;
+        }
+        let norm = clusters[a].centroid.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 1e-6 {
+            for v in &mut clusters[a].centroid {
+                *v /= norm;
+            }
+        }
+        clusters[a].arrival = clusters[a].arrival.min(clusters[b].arrival);
+        clusters.remove(b);
+    }
+
+    // метки кластеров по времени первого появления
+    let mut order: Vec<usize> = (0..clusters.len()).collect();
+    order.sort_by(|&a, &b| clusters[a].arrival.partial_cmp(&clusters[b].arrival).unwrap());
+    let mut label = vec![usize::MAX; clusters.len()];
+    for (new, &ci) in order.iter().enumerate() {
+        label[ci] = new;
+    }
+    let k = clusters.len();
+    let mut seg_cluster = vec![usize::MAX; n];
+    for (ci, c) in clusters.iter().enumerate() {
+        for &i in &c.members {
+            seg_cluster[i] = label[ci];
+        }
+    }
+
+    // Гарантия «только склейка»: дробление эмбеддингов (дрейф внутри одного
+    // голоса) может дать кластеров больше, чем слотов, — такое расщепление
+    // не применяем, пусть лучше останется исходная разметка модели.
+    let distinct_slots: std::collections::HashSet<usize> =
+        segs.iter().map(|s| s.speaker).collect();
+    if k > distinct_slots.len() {
+        tracing::debug!(
+            "диаризация: кластеров ({k}) больше, чем слотов ({}) — расщепление не применяю",
+            distinct_slots.len()
+        );
+        return;
+    }
+
+    // слоты кластера: слот вносит массу в каждый кластер, где у него есть
+    // сегменты (дробление может расщепить и слот — тогда он активен в
+    // нескольких колонках, кадры не теряются)
+    let mut slots_of: Vec<Vec<usize>> = vec![Vec::new(); k];
+    for (si, seg) in segs.iter().enumerate() {
+        slots_of[seg_cluster[si]].push(seg.speaker);
+    }
+    for slots in &mut slots_of {
+        slots.sort_unstable();
+        slots.dedup();
+    }
+
+    // переписываем колонки: новая колонка = max по слотам кластера
+    let mut newp = vec![0f32; num_frames * nspk];
+    for f in 0..num_frames {
+        for (l, slots) in slots_of.iter().enumerate() {
+            let mut m = 0f32;
+            for &s in slots {
+                m = m.max(probs[f * nspk + s]);
+            }
+            newp[f * nspk + l] = m;
+        }
+    }
+    tracing::info!(
+        "диаризация: кластеризация эмбеддингов: {} слотов → {} спикеров",
+        distinct_slots.len(),
+        k
+    );
+    probs.copy_from_slice(&newp);
+}
 
 pub struct NemotronDiarizer {
     session: Session,
@@ -305,6 +486,9 @@ impl NemotronDiarizer {
         let nspk = self.meta.num_speakers;
         let sub = self.meta.subsampling_factor;
         let mut out = vec![0f32; n_frames * nspk];
+        // строки пост-эмбеддера для кластеризации реплик: строка r покрывает
+        // кадры [r*sub, (r+1)*sub) глобальной временной оси
+        let mut embeds: Vec<f32> = Vec::new();
 
         if n_frames > 0 {
             let n_embeds = (n_frames + sub - 1) / sub;
@@ -347,6 +531,10 @@ impl NemotronDiarizer {
                     }
                 }
 
+                // валидные строки шага — те же, что идут в AOSC (правый
+                // контекст отрезается, как в update())
+                embeds.extend_from_slice(&step_embeds[..num_chunk_frames * HIDDEN]);
+
                 self.update(&step_embeds, &step_logits, num_chunk_frames);
                 start_idx += chunk_len;
                 step_no += 1;
@@ -359,6 +547,11 @@ impl NemotronDiarizer {
         for v in out.iter_mut() {
             *v = 1.0 / (1.0 + (-*v).exp());
         }
+
+        // Переназначение меток по кластерам: склейка слотов одного голоса
+        // (дробление при >2 спикерах). При 1:1 кластерах — идентичное
+        // перестановочное преобразование, поведение не меняется.
+        refine_speakers(&mut out, n_frames, nspk, sub, &embeds);
 
         if let Some(dir) = dump {
             let _ = std::fs::create_dir_all(dir);
@@ -602,4 +795,132 @@ fn write_f32(path: PathBuf, data: &[f32]) -> std::io::Result<()> {
         f.write_all(&v.to_le_bytes())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SUB: usize = 8;
+    const FRAMES: usize = 800; // 8 c
+    const NSPK: usize = 8;
+    const ROWS: usize = FRAMES / SUB; // 100 строк эмбеддингов
+
+    /// Синтетика: голос A = a-направление, голос B = b (ортогональны).
+    fn voice_vec(which: usize) -> Vec<f32> {
+        (0..HIDDEN)
+            .map(|i| if i % 2 == which { 1.0 } else { 0.0 })
+            .collect()
+    }
+
+    /// probs: слот `slot` активен на [f0, f1) с p=0.9; embeds: строки
+    /// [r0, r1) = `voice`.
+    fn fixture(spans: &[(usize, usize, usize)], rows: &[(usize, usize, usize)]) -> (Vec<f32>, Vec<f32>) {
+        let mut probs = vec![0f32; FRAMES * NSPK];
+        for &(slot, f0, f1) in spans {
+            for f in f0..f1 {
+                probs[f * NSPK + slot] = 0.9;
+            }
+        }
+        let (a, b) = (voice_vec(0), voice_vec(1));
+        let mut embeds = Vec::with_capacity(ROWS * HIDDEN);
+        for r in 0..ROWS {
+            // строки вне голосовых интервалов (тишина) — фон a, как в
+            // реальном аудио эмбеддинг есть у любого кадра
+            let v = rows
+                .iter()
+                .find(|&&(r0, r1, _)| r >= r0 && r < r1)
+                .map(|&(_, _, which)| if which == 0 { &a } else { &b })
+                .unwrap_or(&a);
+            embeds.extend_from_slice(v);
+        }
+        (probs, embeds)
+    }
+
+    #[test]
+    fn fragmented_voice_merges_into_one_label() {
+        // Sortformer раздробил голос A на слоты 0 и 5; голос B — слот 1.
+        // Аудио: A говорит 0..4 c, B — 4..8 c.
+        let (mut probs, embeds) = fixture(
+            &[(0, 0, 300), (1, 400, FRAMES), (5, 300, 400)],
+            &[(0, 50, 0), (50, 100, 1)],
+        );
+        let before = frame_segments(&probs, FRAMES, NSPK, 0.5);
+        assert_eq!(
+            before.iter().map(|s| s.speaker).collect::<Vec<_>>(),
+            vec![0, 5, 1],
+            "сегменты упорядочены по времени начала"
+        );
+
+        refine_speakers(&mut probs, FRAMES, NSPK, SUB, &embeds);
+
+        let after = frame_segments(&probs, FRAMES, NSPK, 0.5);
+        assert_eq!(
+            after.iter().map(|s| s.speaker).collect::<Vec<_>>(),
+            vec![0, 1],
+            "слоты 0 и 5 должны склеиться, порядок — по первому появлению"
+        );
+        assert!((after[0].start - 0.0).abs() < 1e-9 && (after[0].end - 4.0).abs() < 1e-9);
+        assert!((after[1].start - 4.0).abs() < 1e-9 && (after[1].end - 8.0).abs() < 1e-9);
+        // бывший слот 5 теперь отвечает за метку 0
+        let d = Diarization { probs, num_frames: FRAMES, num_speakers: NSPK };
+        assert_eq!(d.speaker_for_span(3.2, 3.5), Some(0));
+        assert_eq!(d.speaker_for_span(5.0, 6.0), Some(1));
+    }
+
+    #[test]
+    fn distinct_voices_unchanged() {
+        // два разных голоса: кластеризация обязана быть no-op
+        let (mut probs, embeds) = fixture(
+            &[(0, 0, 400), (1, 400, FRAMES)],
+            &[(0, 50, 0), (50, 100, 1)],
+        );
+        let before = probs.clone();
+        refine_speakers(&mut probs, FRAMES, NSPK, SUB, &embeds);
+        assert_eq!(probs, before, "разные голоса не должны склеиваться");
+    }
+
+    #[test]
+    fn single_segment_and_empty_are_noops() {
+        let (mut probs, embeds) = fixture(&[(0, 0, 400)], &[(0, 50, 0)]);
+        let before = probs.clone();
+        refine_speakers(&mut probs, FRAMES, NSPK, SUB, &embeds);
+        assert_eq!(probs, before);
+
+        let mut empty = vec![0f32; FRAMES * NSPK];
+        refine_speakers(&mut empty, FRAMES, NSPK, SUB, &embeds);
+        assert!(empty.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn embedding_drift_split_is_rejected() {
+        // один слот, эмбеддинги дрейфуют на ортогональное направление:
+        // кластеров 2 > 1 слота — расщепление не применяется (no-op)
+        let (mut probs, mut embeds) = fixture(
+            &[(0, 0, 200), (0, 300, 500)],
+            &[(0, 37, 0), (37, ROWS, 1)],
+        );
+        let before = probs.clone();
+        refine_speakers(&mut probs, FRAMES, NSPK, SUB, &embeds);
+        assert_eq!(probs, before, "дрейф эмбеддингов одного слота не должен дробить метку");
+    }
+
+    #[test]
+    fn clustering_is_deterministic() {
+        // три реплики одного голоса в разных слотах + одна чужая
+        let (mut probs, embeds) = fixture(
+            &[(0, 0, 200), (1, 300, 400), (5, 400, 600), (7, 600, FRAMES)],
+            &[(0, 75, 0), (75, 100, 1)],
+        );
+        let mut second = probs.clone();
+        refine_speakers(&mut probs, FRAMES, NSPK, SUB, &embeds);
+        refine_speakers(&mut second, FRAMES, NSPK, SUB, &embeds);
+        assert_eq!(probs, second);
+        let d = Diarization { probs, num_frames: FRAMES, num_speakers: NSPK };
+        // три слота одного голоса → одна метка (плюс чужая); у метки может
+        // быть несколько непрерывных участков — считаем различные метки
+        let used: std::collections::HashSet<usize> =
+            d.segments(0.5).iter().map(|s| s.speaker).collect();
+        assert_eq!(used.len(), 2, "три слота одного голоса → одна метка");
+    }
 }

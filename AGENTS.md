@@ -58,16 +58,17 @@ src/
 ├── mel.rs          — log-mel 64×T, бит-в-бит как torchaudio MelSpectrogram (n_fft 320 / hop 160 / HTK); покадровый API frame_log_mel для стрима
 ├── vad.rs          — Silero v5 ONNX (CPU), стриминг, батчи по 64 окна, гистерезис WhisperX (onset/offset 0.5/0.363)
 ├── segments.rs     — стриминг-чанкер (≤ chunk_size, семантика merge_chunks WhisperX); здесь же фикс хвоста декодера
-├── gigaam.rs       — GigaAM v3 E2E CTC: ONNX Runtime CUDA EP, greedy, слова из CTC-фреймов
+├── gigaam.rs       — GigaAM v3 E2E CTC: ONNX Runtime CUDA EP, greedy, слова из CTC-фреймов; батч-прогон (transcribe_chunks, динамический batch ONNX)
 ├── gigaam_rnnt.rs  — GigaAM v3 E2E RNN-T: encoder + LSTM-prediction + joint
 ├── parakeet.rs     — Parakeet TDT 0.6B v3: mel-ONNX + FastConformer + greedy TDT
 ├── whisper.rs      — whisper.cpp CUDA (ggml-large-v3-turbo), DTW token timestamps
 ├── align.rs        — форс-выравнивание слов CTC-моделью GigaAM (Viterbi по эмиссиям) — фаза --w2v
-├── diarize.rs      — Nemotron-3-Diarization ONNX: mel-128, AOSC-кэш (порт из HF transformers)
+├── diarize.rs      — Nemotron-3-Diarization ONNX: mel-128, AOSC-кэш (порт из HF transformers), кластеризация реплик для склейки раздробленных слотов
 ├── df.rs           — DeepFilterNet 3 шумоподавление (крейт deep_filter/tract, модель вшита)
 ├── transcript.rs   — общие типы результата всех бэкендов (схема WhisperX; channel/turns для многоканальности)
 ├── output.rs       — запись json/srt/vtt/tsv/txt
 ├── models.rs       — резолв путей к моделям (--models-dir → ./models → рядом с exe) + верификация манифестов
+├── download.rs     — автозагрузка недостающих моделей в models/ (HuggingFace/GitHub resolve-URL, докачка по Range, ранняя sha-сверка); таблица «файл → URL» здесь же
 └── stats.rs        — реестр этапов + сводная таблица/машиночитаемый json в конце запуска
 
 src/bin/lighttrans-server.rs — HTTP-сервис: загрузка пулов GigaAM, --ep без fallback, draining по SIGTERM
@@ -90,7 +91,10 @@ deps/               — cuda13 runtime, ffmpeg 9 shared, референсы (в 
    свободной VRAM через NVML).
 3. **Слияние**: результаты собираются строго по порядку чанков — порядок слов и
    тайминги не должны зависеть от числа воркеров. Любой новый этап не имеет права
-   нарушать этот инвариант.
+   нарушать этот инвариант. Батч-инференс CTC (`--batch`) инвариант не трогает
+   (ответы по-прежнему по чанкам), но результат чанка может минимально
+   отличаться от одиночного прогона у краёв из-за паддинга — семантика
+   WhisperX `batch_size`, см. `GigaAmV3::transcribe_chunks`.
 4. Опциональные фазы: `--diarize` (параллельно транскрибации), `--w2v` (вторая фаза
    после транскрибации: воркеры выгружаются, затем 2 сессии GigaAM-CTC выравнивают слова).
 5. **WS-стрим** (`server/ws.rs` → `stream.rs`): воркер CTC-пула арендуется сессии
@@ -166,11 +170,16 @@ deps/               — cuda13 runtime, ffmpeg 9 shared, референсы (в 
    собирает CUDA EP с `error_on_failure` и без ветки «переключиться на CPU»:
    недоступный CUDA — отказ старта (Фаза 4 PORTING.md). CLI сохраняет старое
    поведение (CUDA → CPU fallback) — это различие осознанное.
-9. **Манифесты моделей строгие.** Если рядом с семьёй моделей лежит
-   `manifest.json`, любое расхождение (файл, sha256, IO-имена ONNX) отказывает
-   загрузку; для RNN-T `io` — объединённая поверхность encoder+decoder+joint,
+9. **Манифесты моделей строгие по присутствующим файлам.** Если рядом с семьёй
+   моделей лежит `manifest.json`, любой присутствующий файл с расхождением
+   (размер, sha256, IO-имена ONNX) отказывает загрузку; отсутствующие файлы
+   семье не отказывают (в git коммитятся манифесты без весов) — недостающее
+   докачивает автозагрузка (`src/download.rs`) перед использованием семьи.
+   Для RNN-T `io` — объединённая поверхность encoder+decoder+joint,
    сверяется одним вызовом. Пересобирайте манифесты
-   `scripts/gen_model_manifest.py` при обновлении весов или ONNX-экспорта.
+   `scripts/gen_model_manifest.py` при обновлении весов или ONNX-экспорта;
+   добавляя/переименовывая файлы моделей, не забудьте синхронно править
+   таблицу источников в `download.rs`.
 
 10. **Терминация WS-сессии требует маркера.** Блокирующая сторона стрима
     (`run_stream_side`) отвечает в канал `OutMsg`; после флаша по End она
