@@ -13,6 +13,7 @@ use crate::mel::MelExtractor;
 use crate::ort_assignment::{self, Policy, Role};
 use crate::transcript::{Segment, Word};
 use anyhow::{Context, Result};
+use ort::ep::cuda::ConvAlgorithmSearch;
 use ort::ep::{CUDA, ExecutionProviderDispatch};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
@@ -256,8 +257,12 @@ fn make_session(
     record_assignment: bool,
 ) -> Result<Session> {
     let eps: Vec<ExecutionProviderDispatch> = if use_cuda {
+        // HEURISTIC вместо EXHAUSTIVE: быстрее тёплый старт (см. gigaam.rs)
         // error_on_failure: отказ при недоступном CUDA вместо тихого fallback на CPU (Фаза 4)
-        vec![CUDA::default().build().error_on_failure()]
+        vec![CUDA::default()
+            .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
+            .build()
+            .error_on_failure()]
     } else {
         vec![]
     };

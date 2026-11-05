@@ -31,13 +31,15 @@ use std::time::Instant;
     disable_help_flag = true,
     term_width = 120,
     about = "Транскрибация аудио/видео на GPU: GigaAM v3 CTC/RNN-T, Whisper Turbo, Parakeet v3",
-    after_help = "Примеры:
-  lighttrans video.mp4                        gigaam-v3, русский
-  lighttrans talk.mkv -m whisper-turbo -l ru --w2v   пословные таймстампы
-  lighttrans rec.mp3 --diarize --denoise      спикеры + шумоподавление
+    after_help = "Модели (-m): gigaam-v3-ctc (gc), gigaam-v3-rnnt (gr, по умолчанию),
+  whisper-large-v3-turbo (wt), parakeet-v3 (pr) — приняты и старые имена
+Примеры:
+  lighttrans video.mp4                        gigaam-v3-rnnt, русский
+  lighttrans talk.mkv -m wt -l ru --w2v       пословные таймстампы (whisper)
+  lighttrans rec.mp3 -dr -dn                  спикеры + шумоподавление
   lighttrans conf.wav --split-channels --turns  каждый канал — спикер, диалог
   lighttrans vad meeting.mp4 -o intervals.json   интервалы речи (Silero), без распознавания
-  lighttrans bench video.mp4 -m gigaam-v3        этапы и RTF, машиночитаемый json"
+  lighttrans bench video.mp4 -m gc               этапы и RTF, машиночитаемый json"
 )]
 struct Args {
     /// vad — интервалы речи Silero (json); bench — бенчмарк этапов и RTF;
@@ -55,8 +57,9 @@ struct TranscribeArgs {
     /// Входные аудио/видео файлы
     files: Vec<PathBuf>,
 
-    /// модель: gigaam-v3|gigaam-v3-rnnt|whisper-turbo|parakeet-v3
-    #[arg(short, long, value_enum, hide_possible_values = true, default_value = "gigaam-v3")]
+    /// модель: gigaam-v3-ctc (gc) | gigaam-v3-rnnt (gr) |
+    /// whisper-large-v3-turbo (wt) | parakeet-v3 (pr)
+    #[arg(short, long, value_enum, hide_possible_values = true, default_value = "gr")]
     model: ModelKind,
 
     /// cuda | cpu
@@ -107,7 +110,7 @@ struct TranscribeArgs {
     #[arg(short = 'f', long, default_value = "all")]
     output_format: String,
 
-    /// разделение спикеров (Nemotron, до 8)
+    /// разделение спикеров (Nemotron, до 8); сокращение: -dr
     #[arg(long, conflicts_with_all = ["split_channels", "turns"])]
     diarize: bool,
 
@@ -131,7 +134,7 @@ struct TranscribeArgs {
     #[arg(long)]
     dtw: bool,
 
-    /// шумоподавление DeepFilterNet 3
+    /// шумоподавление DeepFilterNet 3; сокращение: -dn
     #[arg(long)]
     denoise: bool,
 
@@ -322,16 +325,26 @@ fn dialog_text(turns: &[transcript::Turn]) -> String {
 }
 
 fn main() -> Result<()> {
+    // -dr/-dn — двухбуквенные сокращения --diarize/--denoise: clap не умеет
+    // многосимвольные шорты, разворачиваем до парса (токен целиком)
+    let argv: Vec<String> = std::env::args().enumerate().map(|(i, a)| if i == 0 {
+        a
+    } else {
+        match a.as_str() {
+            "-dr" => "--diarize".to_string(),
+            "-dn" => "--denoise".to_string(),
+            _ => a,
+        }
+    }).collect();
     // без аргументов или с -h/--help — компактная справка с постраничной
     // прокруткой, если она не влезает в экран
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.is_empty() || argv.iter().any(|a| a == "-h" || a == "--help") {
+    if argv.len() == 1 || argv.iter().any(|a| a == "-h" || a == "--help") {
         print_paged(&Args::command().render_help().to_string());
         return Ok(());
     }
 
     stats::init();
-    let cli = Args::parse();
+    let cli = Args::parse_from(argv);
     // bench печатает в stdout машиночитаемый json — все логи уходят в stderr
     let bench = matches!(cli.command, Some(Cmd::Bench { .. }));
     init_tracing(bench);

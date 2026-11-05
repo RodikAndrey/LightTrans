@@ -24,10 +24,13 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use std::sync::Arc;
 
-/// Пулы воркеров по моделям: сессии живут между запросами.
+/// Пулы воркеров по моделям: сессии живут между запросами. CTC-пул обязателен
+/// (его арендует WS-стрим), остальные — по выбору `--models` сервера.
 pub struct ModelPools {
     pub ctc: Arc<WorkerPool>,
     pub rnnt: Option<Arc<WorkerPool>>,
+    pub whisper: Option<Arc<WorkerPool>>,
+    pub parakeet: Option<Arc<WorkerPool>>,
 }
 
 impl ModelPools {
@@ -35,9 +38,39 @@ impl ModelPools {
         self.rnnt.is_some()
     }
 
+    /// Пул для модели; `None` — модель не загружена при старте.
+    pub fn get(&self, kind: crate::worker::ModelKind) -> Option<&Arc<WorkerPool>> {
+        use crate::worker::ModelKind;
+        match kind {
+            ModelKind::GigaamV3 => Some(&self.ctc),
+            ModelKind::GigaamV3Rnnt => self.rnnt.as_ref(),
+            ModelKind::WhisperTurbo => self.whisper.as_ref(),
+            ModelKind::ParakeetV3 => self.parakeet.as_ref(),
+        }
+    }
+
+    /// Загруженные модели в канонических id, в порядке пулов.
+    pub fn loaded_models(&self) -> Vec<&'static str> {
+        use crate::worker::ModelKind;
+        let mut v = vec![ModelKind::GigaamV3.id()];
+        if self.rnnt.is_some() {
+            v.push(ModelKind::GigaamV3Rnnt.id());
+        }
+        if self.whisper.is_some() {
+            v.push(ModelKind::WhisperTurbo.id());
+        }
+        if self.parakeet.is_some() {
+            v.push(ModelKind::ParakeetV3.id());
+        }
+        v
+    }
+
     pub fn worker_count(&self) -> usize {
-        let rnnt = self.rnnt.as_ref().map(|p| p.len()).unwrap_or(0);
-        self.ctc.len() + rnnt
+        [Some(&self.ctc), self.rnnt.as_ref(), self.whisper.as_ref(), self.parakeet.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|p| p.len())
+            .sum()
     }
 }
 

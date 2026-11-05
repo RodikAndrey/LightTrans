@@ -16,6 +16,7 @@
 use crate::mel::MelExtractor;
 use crate::transcript::{Segment, Word};
 use anyhow::{Context, Result};
+use ort::ep::cuda::ConvAlgorithmSearch;
 use ort::ep::{CUDA, ExecutionProviderDispatch};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
@@ -38,8 +39,14 @@ pub struct WordAligner {
 
 impl WordAligner {
     pub fn load(model: &Path, vocab_path: &Path, use_cuda: bool, intra: usize) -> Result<Self> {
-        let eps: Vec<ExecutionProviderDispatch> =
-            if use_cuda { vec![CUDA::default().build()] } else { vec![] };
+        let eps: Vec<ExecutionProviderDispatch> = if use_cuda {
+            // HEURISTIC вместо EXHAUSTIVE: быстрее тёплый старт (см. gigaam.rs)
+            vec![CUDA::default()
+                .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
+                .build()]
+        } else {
+            vec![]
+        };
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)

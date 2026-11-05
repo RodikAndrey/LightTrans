@@ -103,8 +103,14 @@ impl StreamQuery {
         let p = QueryParameters::parse(raw)?;
         p.reject_unknown(STREAM_QUERY_KEYS)?;
         match p.get("model") {
-            None | Some("ctc") => {}
-            Some(v) => return Err(format!("stream supports only model=ctc, got {v:?}")),
+            // MVP-срез — только CTC; имя принимается и как в CLI: ctc (старое),
+            // gigaam-v3-ctc/gc/gigaam-v3
+            None | Some("ctc") | Some("gigaam-v3-ctc") | Some("gc") | Some("gigaam-v3") => {}
+            Some(v) => {
+                return Err(format!(
+                    "stream supports only model=ctc (aliases: ctc|gigaam-v3-ctc|gc|gigaam-v3), got {v:?}"
+                ))
+            }
         }
         let rate_text = p
             .get("rate")

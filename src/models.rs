@@ -89,8 +89,15 @@ pub fn resolve(explicit: Option<&Path>) -> anyhow::Result<ModelPaths> {
         base.join("parakeet-v3"),
         base.join("wav2vec2-align-ru"),
     ];
+    // один кэш верификации на все семьи: грузим до проверки, сохраняем после
+    let cache_path = base.join(crate::manifest::VERIFY_CACHE_FILE);
+    let mut cache = crate::manifest::load_verify_cache(&cache_path);
+    let cache_before = cache.clone();
     for dir in &family_dirs {
-        verify_family(dir)?;
+        verify_family(dir, &base, &mut cache)?;
+    }
+    if cache != cache_before {
+        crate::manifest::save_verify_cache(&cache_path, &cache);
     }
 
     let gigaam_dir = base.join(GIGAAM_DIR);
@@ -110,14 +117,23 @@ pub fn resolve(explicit: Option<&Path>) -> anyhow::Result<ModelPaths> {
 /// нескачанная семья не должна валить чужие запуски: она либо будет
 /// докачана автозагрузкой до использования, либо откажет уже на загрузке
 /// сессии с понятным именем файла.
-fn verify_family(dir: &Path) -> anyhow::Result<()> {
+fn verify_family(dir: &Path, base: &Path, cache: &mut crate::manifest::VerifyCache) -> anyhow::Result<()> {
     if !dir.exists() {
         return Ok(());
     }
     let Some(m) = crate::manifest::load_for(dir) else {
         return Ok(());
     };
-    let missing = m.verify_files_partial(dir)?;
+    // кэш верификации: перечитывать ~7 ГБ весов под sha256 на каждый запуск
+    // не нужно — хеш пересчитывается только после изменения файла или манифеста
+    let prefix = dir
+        .strip_prefix(base)
+        .unwrap_or(dir)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    let missing = m.verify_files_cached(dir, &prefix, cache)?;
     if !missing.is_empty() {
         tracing::warn!(
             "манифест {}: отсутствуют файлы {:?} — семья установлена частично; \

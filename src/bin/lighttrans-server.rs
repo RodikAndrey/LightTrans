@@ -30,10 +30,12 @@ enum Ep {
 #[command(
     name = "lighttrans-server",
     version,
-    about = "HTTP-сервис транскрибации: POST /v1/transcribe (GigaAM v3 CTC/RNN-T)",
-    after_help = "Лимиты окружением (неверное значение отказывает, не подменяется):\n\
+    about = "HTTP-сервис транскрибации: POST /v1/transcribe (GigaAM v3 CTC/RNN-T, Whisper Turbo, Parakeet v3)",
+    after_help = "Модели --models: gigaam-v3-ctc (gc), gigaam-v3-rnnt (gr),\n\
+                  whisper-large-v3-turbo (wt), parakeet-v3 (pr); CTC-пул обязателен.\n\
+                  Лимиты окружением (неверное значение отказывает, не подменяется):\n\
                   ASR_MAX_CONCURRENCY=8 ASR_BODY_LIMIT_MB=64 ASR_REQ_TIMEOUT_SEC=120\n\
-                  Верификация CUDA-назначений (Фаза 4; только с --ep cuda):\n\
+                  Верификация CUDA-назначений (Фаза 4; только с --ep cuda, роли CTC/RNNT):\n\
                   ASR_CUDA_ASSIGNMENT_POLICY=verified|allow-unverified\n\
                   ASR_CUDA_CTC_ASSIGNMENT_SHA256 ASR_CUDA_RNNT_ASSIGNMENT_SHA256"
 )]
@@ -50,7 +52,12 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Ep::Cuda)]
     ep: Ep,
 
-    /// не загружать RNN-T (только CTC)
+    /// загружаемые модели через запятую: gc|gr|wt|pr и полные имена
+    /// (см. --help); CTC-пул (gc) обязателен — его арендует WS-стрим
+    #[arg(long, default_value = "gc,gr")]
+    models: String,
+
+    /// не загружать RNN-T (только CTC); сокращение для --models gc
     #[arg(long)]
     no_rnnt: bool,
 
@@ -78,21 +85,41 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    // состав пулов: алиасы как в CLI, дубликаты отбрасываются, CTC обязателен
+    let mut wanted: Vec<ModelKind> = args
+        .models
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            ModelKind::parse(s)
+                .ok_or_else(|| anyhow::anyhow!("--models: неизвестная модель {s:?} (допустимо: gc|gr|wt|pr и полные имена)"))
+        })
+        .collect::<Result<_>>()?;
+    wanted.dedup();
+    if args.no_rnnt {
+        wanted.retain(|k| *k != ModelKind::GigaamV3Rnnt);
+    }
+    if !wanted.contains(&ModelKind::GigaamV3) {
+        anyhow::bail!("--models: CTC-пул (gc) обязателен — его арендует /v1/stream и требует health");
+    }
     // конфигурация окружения проверяется до всякой работы с моделями:
     // кривое значение env отказывает, а не подменяется дефолтом
     let limits = server::config::ServerLimits::from_env()
         .map_err(|e| anyhow::anyhow!("конфигурация окружения: {e}"))?;
     let use_cuda = args.ep == Ep::Cuda;
     // политика верификации CUDA-назначений — тоже до загрузки моделей;
-    // Arc: политики живут в потоках-воркерах ('static)
-    let policy: Option<Arc<Policy>> = Policy::from_env(use_cuda, !args.no_rnnt)
+    // Arc: политики живут в потоках-воркерах ('static). Схема покрывает
+    // только роли CTC/RNNT — whisper/parakeet вне неё
+    let with_rnnt = wanted.contains(&ModelKind::GigaamV3Rnnt);
+    let policy: Option<Arc<Policy>> = Policy::from_env(use_cuda, with_rnnt)
         .map_err(|e| anyhow::anyhow!("конфигурация окружения: {e}"))?
         .map(Arc::new);
     // автозагрузка до resolve: манифесты проверяются строго, файлы должны
-    // лежать на месте до верификации; сервер держит пулы CTC (+ RNN-T)
-    let mut need = vec![download::Family::SileroVad, download::Family::GigaamV3Ctc];
-    if !args.no_rnnt {
-        need.push(download::Family::GigaamV3Rnnt);
+    // лежать на месте до верификации
+    let mut need = vec![download::Family::SileroVad];
+    for kind in &wanted {
+        need.push(download::Family::from(*kind));
     }
     download::ensure(
         &models::base_dir(args.models_dir.as_deref()),
@@ -104,7 +131,7 @@ fn main() -> Result<()> {
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
-    // --- загрузка моделей: пул CTC всегда, пул RNN-T без --no-rnnt ---
+    // --- загрузка моделей: пул на каждую выбранную модель ---
     let _load_span = stats::span("загрузка ASR-модели", None);
     let load_model = |kind: ModelKind, use_cuda: bool| -> Result<Vec<Worker>> {
         let count = if args.workers > 0 {
@@ -148,10 +175,15 @@ fn main() -> Result<()> {
     let metrics = Metrics::new_arc();
     metrics.set_max_transcribe(limits.max_concurrency);
     // Выбор провайдера явный и окончательный: при ошибке — отказ (Фаза 4),
-    // fallback на CPU убран сознательно.
+    // fallback на CPU убран сознательно. Язык: gigaam — русский контракт
+    // сервиса, whisper/parakeet — автоопределение.
     let build_pool = |kind: ModelKind, use_cuda: bool| -> Result<WorkerPool> {
         let opts = lighttrans::pipeline::WorkerOpts {
-            language: "ru".into(),
+            language: if matches!(kind, ModelKind::GigaamV3 | ModelKind::GigaamV3Rnnt) {
+                "ru".into()
+            } else {
+                "auto".into()
+            },
             translate: false,
             beam_size: 1,
             n_threads: if use_cuda { 4 } else { cores },
@@ -167,19 +199,25 @@ fn main() -> Result<()> {
         );
         Ok(WorkerPool::start(workers, opts))
     };
+    let build_optional = |kind: ModelKind| -> Result<Option<Arc<WorkerPool>>> {
+        if wanted.contains(&kind) {
+            Ok(Some(Arc::new(build_pool(kind, use_cuda)?)))
+        } else {
+            Ok(None)
+        }
+    };
 
     let ctc = Arc::new(build_pool(ModelKind::GigaamV3, use_cuda)?);
-    let rnnt = if args.no_rnnt {
-        None
-    } else {
-        Some(Arc::new(build_pool(ModelKind::GigaamV3Rnnt, use_cuda)?))
-    };
+    let rnnt = build_optional(ModelKind::GigaamV3Rnnt)?;
+    let whisper = build_optional(ModelKind::WhisperTurbo)?;
+    let parakeet = build_optional(ModelKind::ParakeetV3)?;
     drop(_load_span);
-    tracing::info!("воркеров всего: {}", ctc.len() + rnnt.as_ref().map(|p| p.len()).unwrap_or(0));
+    let pools = ModelPools { ctc, rnnt, whisper, parakeet };
+    tracing::info!("воркеров всего: {}", pools.worker_count());
 
     let admission = server::admission::AdmissionState::new(limits.max_concurrency);
     let state = AppState::new(ServerInner {
-        pools: ModelPools { ctc, rnnt },
+        pools,
         admission,
         limits,
         paths,
@@ -215,8 +253,8 @@ async fn serve(state: AppState, port: u16) -> Result<()> {
         .await
         .with_context(|| format!("bind 0.0.0.0:{port}"))?;
     tracing::info!(
-        "lighttrans-server слушает 0.0.0.0:{port} (models: gigaam-v3{}, лимит {}, тело {} МБ, тайм-аут {} c)",
-        if state.inner().pools.has_rnnt() { ", gigaam-v3-rnnt" } else { "" },
+        "lighttrans-server слушает 0.0.0.0:{port} (models: {}, лимит {}, тело {} МБ, тайм-аут {} c)",
+        state.inner().pools.loaded_models().join(", "),
         state.inner().limits.max_concurrency,
         state.inner().limits.body_limit_bytes / (1024 * 1024),
         state.inner().limits.request_timeout.as_secs(),

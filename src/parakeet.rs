@@ -9,6 +9,7 @@
 
 use crate::transcript::{Segment, Word};
 use anyhow::{Context, Result};
+use ort::ep::cuda::ConvAlgorithmSearch;
 use ort::ep::{CUDA, ExecutionProviderDispatch};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
@@ -301,8 +302,14 @@ fn extract_states(out: &ort::session::SessionOutputs<'_>) -> Result<(Vec<f32>, V
 }
 
 fn make_session(model: &Path, use_cuda: bool, intra: usize) -> Result<Session> {
-    let eps: Vec<ExecutionProviderDispatch> =
-        if use_cuda { vec![CUDA::default().build()] } else { vec![] };
+    let eps: Vec<ExecutionProviderDispatch> = if use_cuda {
+        // HEURISTIC вместо EXHAUSTIVE: быстрее тёплый старт (см. gigaam.rs)
+        vec![CUDA::default()
+            .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
+            .build()]
+    } else {
+        vec![]
+    };
     Session::builder()
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .with_optimization_level(GraphOptimizationLevel::Level3)

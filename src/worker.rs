@@ -13,21 +13,26 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ModelKind {
     /// Whisper Large v3 Turbo (multilingual, ggml/whisper.cpp CUDA)
+    #[value(name = "whisper-large-v3-turbo", aliases = ["wt", "whisper-turbo"])]
     WhisperTurbo,
     /// GigaAM v3 E2E CTC (Russian, ONNX Runtime CUDA, punctuation + ITN)
+    #[value(name = "gigaam-v3-ctc", aliases = ["gc", "gigaam-v3"])]
     GigaamV3,
     /// GigaAM v3 E2E RNN-T (Russian, ONNX Runtime CUDA, punctuation + ITN)
+    #[value(name = "gigaam-v3-rnnt", aliases = ["gr"])]
     GigaamV3Rnnt,
     /// Parakeet TDT 0.6B v3 (25 европейских языков, ONNX Runtime CUDA)
+    #[value(name = "parakeet-v3", aliases = ["pr"])]
     ParakeetV3,
 }
 
 impl ModelKind {
-    /// Строковый идентификатор модели (CLI/HTTP: `--model`, query `model`).
+    /// Канонический строковый идентификатор модели (CLI `--model`, HTTP query
+    /// `model` и поле `model` в ответах). Алиасы ввода — см. `parse`.
     pub fn id(self) -> &'static str {
         match self {
-            ModelKind::WhisperTurbo => "whisper-turbo",
-            ModelKind::GigaamV3 => "gigaam-v3",
+            ModelKind::WhisperTurbo => "whisper-large-v3-turbo",
+            ModelKind::GigaamV3 => "gigaam-v3-ctc",
             ModelKind::GigaamV3Rnnt => "gigaam-v3-rnnt",
             ModelKind::ParakeetV3 => "parakeet-v3",
         }
@@ -35,10 +40,12 @@ impl ModelKind {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "whisper-turbo" => Some(ModelKind::WhisperTurbo),
-            "gigaam-v3" => Some(ModelKind::GigaamV3),
-            "gigaam-v3-rnnt" => Some(ModelKind::GigaamV3Rnnt),
-            "parakeet-v3" => Some(ModelKind::ParakeetV3),
+            // полные имена и сокращения (как в CLI), плюс старые имена для
+            // совместимости (HTTP-контракт и старые скрипты)
+            "whisper-large-v3-turbo" | "whisper-turbo" | "wt" => Some(ModelKind::WhisperTurbo),
+            "gigaam-v3-ctc" | "gigaam-v3" | "gc" => Some(ModelKind::GigaamV3),
+            "gigaam-v3-rnnt" | "gr" => Some(ModelKind::GigaamV3Rnnt),
+            "parakeet-v3" | "pr" => Some(ModelKind::ParakeetV3),
             _ => None,
         }
     }

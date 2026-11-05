@@ -98,13 +98,16 @@ impl TranscribeQuery {
         let parameters = QueryParameters::parse(raw)?;
         parameters.reject_unknown(TRANSCRIBE_QUERY_KEYS)?;
         let model = match parameters.get("model") {
-            None | Some("gigaam-v3") => ModelKind::GigaamV3,
-            Some("gigaam-v3-rnnt") => ModelKind::GigaamV3Rnnt,
-            Some(value) => {
-                return Err(format!(
-                    "model must be gigaam-v3 or gigaam-v3-rnnt, got {value:?}"
-                ))
-            }
+            // паритет с CLI: полные имена, сокращения gc/gr/wt/pr и старые
+            // gigaam-v3/whisper-turbo; сервер обслуживает только gigaam —
+            // остальные имена принимаются здесь и отказывают на диспетче
+            None => ModelKind::GigaamV3,
+            Some(value) => ModelKind::parse(value).ok_or_else(|| {
+                format!(
+                    "unknown model {value:?} (expected gigaam-v3-ctc|gc, gigaam-v3-rnnt|gr, \
+                     whisper-large-v3-turbo|wt, parakeet-v3|pr)"
+                )
+            })?,
         };
         let ext = match parameters.get("ext") {
             None => None,
@@ -293,15 +296,13 @@ fn do_transcribe(
     _permit: PermitWithMetrics,
 ) -> WorkResult {
     let inner = server.inner();
-    let pool = match query.model {
-        ModelKind::GigaamV3 => Arc::clone(&inner.pools.ctc),
-        ModelKind::GigaamV3Rnnt => Arc::clone(inner.pools.rnnt.as_ref().ok_or_else(|| {
-            WorkError::BadRequest("gigaam-v3-rnnt model is not loaded".into())
-        })?),
-        _ => {
+    let pool = match inner.pools.get(query.model) {
+        Some(pool) => Arc::clone(pool),
+        None => {
             return Err(WorkError::BadRequest(format!(
-                "model must be gigaam-v3 or gigaam-v3-rnnt, got {:?}",
-                query.model.id()
+                "model {} is not loaded (loaded models: {})",
+                query.model.id(),
+                inner.pools.loaded_models().join(", ")
             )))
         }
     };
@@ -657,7 +658,14 @@ mod tests {
         assert!(q.words);
         assert!(q.split);
         assert_eq!(q.turn_gap, 1.5);
-        assert!(TranscribeQuery::parse(Some("model=whisper-turbo")).is_err());
+        // паритет с CLI: полные имена и сокращения; wt/pr парсятся, но
+        // отказывают на диспетче (сервер держит только gigaam-пулы)
+        assert_eq!(TranscribeQuery::parse(Some("model=gigaam-v3")).unwrap().model, ModelKind::GigaamV3);
+        assert_eq!(TranscribeQuery::parse(Some("model=gigaam-v3-ctc")).unwrap().model, ModelKind::GigaamV3);
+        assert_eq!(TranscribeQuery::parse(Some("model=gc")).unwrap().model, ModelKind::GigaamV3);
+        assert_eq!(TranscribeQuery::parse(Some("model=gr")).unwrap().model, ModelKind::GigaamV3Rnnt);
+        assert_eq!(TranscribeQuery::parse(Some("model=whisper-turbo")).unwrap().model, ModelKind::WhisperTurbo);
+        assert!(TranscribeQuery::parse(Some("model=foo")).is_err());
         assert!(TranscribeQuery::parse(Some("channels=merge")).is_err());
         assert!(TranscribeQuery::parse(Some("ext=flac10")).is_err());
         assert!(TranscribeQuery::parse(Some("turn_gap=0")).is_err());

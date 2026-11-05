@@ -1,8 +1,15 @@
 [package]
 name = "lighttrans"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Fast GPU audio/video transcription (WhisperX-style pipeline) in Rust: GigaAM v3 E2E CTC + Whisper Large v3 Turbo"
+
+[features]
+default = ["whisper-cuda"]
+# CUDA у whisper.cpp собирается nvcc, который не умеет кросс-компилировать
+# Linux → Windows: кросс-сборка под Windows идёт с --no-default-features
+# (whisper остаётся CPU-вариантом, остальные бэкенды — через CUDA EP ONNX Runtime)
+whisper-cuda = ["whisper-rs/cuda"]
 
 [dependencies]
 anyhow = "1"
@@ -38,7 +45,7 @@ sha2 = "0.10"
 ureq = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-whisper-rs = { version = "0.16.0", features = ["cuda", "raw-api"] }
+whisper-rs = { version = "0.16.0", features = ["raw-api"] }
 
 [profile.release]
 lto = "thin"

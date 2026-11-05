@@ -7,6 +7,7 @@ use crate::mel::MelExtractor;
 use crate::ort_assignment::{self, Policy, Role};
 use crate::transcript::{Segment, Word};
 use anyhow::{Context, Result};
+use ort::ep::cuda::ConvAlgorithmSearch;
 use ort::ep::{CUDA, ExecutionProviderDispatch};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
@@ -31,8 +32,14 @@ impl GigaAmV3 {
         policy: Option<&Policy>,
     ) -> Result<Self> {
         let eps: Vec<ExecutionProviderDispatch> = if use_cuda {
+            // HEURISTIC вместо дефолтного EXHAUSTIVE: cuDNN не бенчмаркает все
+            // алгоритмы свёрток на первом прогоне — тёплый старт заметно быстрее,
+            // на конформерных свёртках разницы в скорости инференса нет
             // error_on_failure: отказ при недоступном CUDA вместо тихого fallback на CPU (Фаза 4)
-            vec![CUDA::default().build().error_on_failure()]
+            vec![CUDA::default()
+                .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
+                .build()
+                .error_on_failure()]
         } else {
             vec![]
         };

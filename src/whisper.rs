@@ -217,17 +217,47 @@ impl WhisperTurbo {
                 }
                 cur.clear();
             } else {
-                // fallback: classic token t0/t1 (cs) — one word per token
+                // fallback: classic token t0/t1 (cs). whisper.cpp помечает
+                // начало слова пробелом в тексте токена — слова собираем по
+                // этим маркерам: текст режется на сабтокены (ru), и без
+                // группировки один word = один сабтокен («Д обр ый»)
+                let mut cur_text = String::new();
+                let mut cur_start = 0i64;
+                let mut cur_end = 0i64;
+                let mut cur_probs: Vec<f32> = Vec::new();
+                let flush = |words: &mut Vec<Word>,
+                                 cur_text: &mut String,
+                                 cur_start: &mut i64,
+                                 cur_end: &mut i64,
+                                 cur_probs: &mut Vec<f32>| {
+                    if !cur_text.is_empty() {
+                        let start = *cur_start;
+                        let end = (*cur_end).max(start + 1);
+                        words.push(Word {
+                            word: std::mem::take(cur_text),
+                            start: offset + start as f64 / 100.0,
+                            end: offset + end as f64 / 100.0 + offset,
+                            score: Some(score(cur_probs)),
+                            speaker: None,
+                            channel: None,
+                        });
+                        cur_probs.clear();
+                    }
+                };
                 for row in seg_rows {
-                    words.push(Word {
-                        word: row.text.trim_start_matches(' ').to_string(),
-                        start: offset + row.t0 as f64 / 100.0,
-                        end: (row.t1.max(row.t0 + 1)) as f64 / 100.0 + offset,
-                        score: Some(row.p),
-                        speaker: None,
-                        channel: None,
-                    });
+                    let piece = row.text.trim_start_matches(' ');
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    if row.text.starts_with(' ') || cur_text.is_empty() {
+                        flush(&mut words, &mut cur_text, &mut cur_start, &mut cur_end, &mut cur_probs);
+                        cur_start = row.t0;
+                    }
+                    cur_text.push_str(piece);
+                    cur_end = row.t1.max(row.t0 + 1);
+                    cur_probs.push(row.p);
                 }
+                flush(&mut words, &mut cur_text, &mut cur_start, &mut cur_end, &mut cur_probs);
             }
             if !words.is_empty() {
                 seg.start = words[0].start;

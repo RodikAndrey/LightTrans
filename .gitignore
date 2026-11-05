@@ -6,6 +6,8 @@ models/**/*.bin
 models/**/*.onnx
 models/**/*.onnx.data
 models/**/*.safetensors
+# кэш результатов верификации манифестов (src/manifest.rs)
+models/.verify-cache.json
 
 # сгенерированные тест-фикстуры (воспроизводятся скриптами tests/*.py)
 tests/*.mp3
